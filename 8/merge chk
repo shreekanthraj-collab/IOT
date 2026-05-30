@@ -1,0 +1,1218 @@
+// ================== FIRMWARE v1.1.1 — SOFT START MERGED ==================
+// Base: v1.1.1 debugged (all FIX-01…FIX-11 intact, zero lines disturbed)
+// Merge: RS775 soft-start via BC847B transistor on PWM_PIN 25
+//
+// NEW HARDWARE PIN:
+//   PWM_PIN 25  — BC847B base through 1 kΩ resistor (soft-start switch)
+//
+// EXISTING PINS — UNCHANGED:
+//   RELAY_PWR  5   → K3 main bypass relay  (was direct power; now bypass)
+//   RELAY_FWD 18   → K1 forward direction relay
+//   RELAY_REV 19   → K2 reverse direction relay
+//   LIMIT_SWITCH_PIN 27, BUZZER_PIN 23, SDA 21, SCL 22  — all untouched
+//
+// SOFT-START SEQUENCE (startMotor):
+//   1. clearRelays() — all off + PWM 0                (shoot-through safe)
+//   2. Direction relay (FWD or REV) ON                (K1 or K2)
+//   3. RELAY_PWR (bypass K3) stays OFF
+//   4. softStart() — ramp PWM 0→255 over ~2.5 s       (transistor limits I)
+//   5. Bypass relay (K3) ON — transistor bypassed      (full power)
+//   6. PWM held at 255 (transistor still saturated, relay carries load)
+//
+// SOFT-STOP SEQUENCE (stopMotor):
+//   1. RELAY_PWR (bypass K3) OFF first                (current to transistor)
+//   2. Ramp PWM 255→0 over ~2.5 s                    (smooth current decay)
+//   3. PWM = 0, direction relays OFF                  (fully off)
+//
+// ALL FIX-01…FIX-11 comments preserved verbatim.
+// BUZZER: zero changes.
+// =========================================================================
+
+
+
+
+#include <Wire.h>
+#include <INA226_WE.h>
+#include <Preferences.h>
+#include <Update.h>
+#include <ArduinoJson.h>
+#define TINY_GSM_MODEM_BG96
+
+
+
+
+#include <TinyGsmClient.h>
+#include <PubSubClient.h>
+
+
+
+
+HardwareSerial SerialAT(2);
+TinyGsm modem(SerialAT);
+TinyGsmClient gsmClient(modem);
+PubSubClient mqtt(gsmClient);
+
+
+
+
+// ================== FIRMWARE VERSION ==================
+// [NEW-4] Version tracking for OTA update notification
+#define FW_VERSION "1.1.1"
+bool    updateAvailable   = false;
+String  pendingUpdateURL  = "";
+String  pendingUpdateVer  = "";
+
+
+
+
+// ================== MQTT ==================
+const char* mqttServer = "broker.hivemq.com";
+const int   mqttPort   = 1883;
+String pubTopic;
+String subTopic;
+String updateTopic;
+unsigned long mqttRetryTimer = 0;
+
+
+
+
+// [NEW-1] MQTT sleep-check interval
+#define MQTT_SLEEP_CHECK_MS  60000UL
+unsigned long mqttSleepCheckTimer = 0;
+
+
+
+
+String DEVICE_ID = "";
+void handleJSONCommand(String input);
+
+
+
+
+// ================== PINS ==================
+// ── Existing relay pins — UNCHANGED ──
+#define RELAY_PWR        5    // K3: main bypass relay
+#define RELAY_FWD       18    // K1: forward direction relay
+#define RELAY_REV       19    // K2: reverse direction relay
+#define LIMIT_SWITCH_PIN 27
+#define BUZZER_PIN      23
+#define SDA_PIN         21
+#define SCL_PIN         22
+
+// ── NEW: soft-start PWM pin ──
+#define PWM_PIN         25    // BC847B base via 1 kΩ — free pin, no conflict
+#define PWM_FREQ      5000    // Hz
+#define PWM_RES          8    // bits (0–255 duty)
+
+
+
+
+#define RELAY_ON  LOW
+#define RELAY_OFF HIGH
+
+
+
+
+#define INA_ADDR    0x40
+#define AS5600_ADDR 0x36
+
+
+
+
+INA226_WE ina226(INA_ADDR);
+Preferences prefs;
+
+
+
+
+// ================== STATES ==================
+enum State { IDLE, FORWARD_RUN, REVERSE_RUN };
+State motorState      = IDLE;
+State lastDirection   = FORWARD_RUN;
+State resumeDirection = IDLE;
+bool  resumePending   = false;
+
+
+
+
+// ================== FIRMWARE STATE ==================
+enum FirmwareState { FW_INIT, FW_ACTIVE, FW_SLEEP };
+FirmwareState fwState = FW_INIT;
+
+
+
+
+// ================== LIMITS ==================
+#define MIN_TURNS  1.0
+#define MAX_TURNS 10.0
+
+
+
+
+// ================== VOLTAGE ==================
+#define WARN_V_LOW  10.7
+#define WARN_V_HIGH 11.0
+#define CUT_V       10.5
+#define CRITICAL_V   9.5
+#define RESET_V     11.0
+
+
+
+
+enum VoltageState { NORMAL, WARNING, WAIT_BYPASS, BYPASS_ACTIVE, LOCKED };
+VoltageState vState = NORMAL;   // FIX-08: removed unused vStatePrev
+
+
+
+
+// ================== CURRENT ==================
+// [NEW-3] OC threshold is now runtime-adjustable via JSON SET_CURRENT command
+float CURRENT_OFF = 1.5;
+#define RETRY_DELAY 30000
+int  retryCount  = 0;
+bool ocFault     = false;
+bool lockFault   = false;
+unsigned long ocTripTime = 0;
+
+
+
+
+// ================== ENCODER ==================
+int16_t angle = 0, prevAngle = 0;
+long    rotationCount = 0;
+float   totalTurns    = 0;
+
+
+
+
+// ================== BUZZER ==================
+// [UNCHANGED] — identical to original
+unsigned long buzzerTimer = 0;
+int  buzzerStep     = 0;
+bool buzzerPinState = false;
+
+
+
+
+// ================== FLAGS ==================
+bool lastLimitState  = HIGH;
+bool lastOvercurrent = false;
+bool limitOverride   = false;
+
+
+// ================== TIMERS ==================
+unsigned long dashboardTimer  = 0;
+unsigned long lowVoltStart    = 0;
+bool          lowVoltDetected = false;
+unsigned long idleStart = 0;
+unsigned long warnPrintTimer  = 0;
+unsigned long bypassSleepTimer = 0;
+bool bypassSleepPending = false;
+unsigned long livePub = 0;
+unsigned long saveTimer = 0;
+
+
+// ================== SLEEP ==================
+bool sleepMode    = false;
+bool idleTracking = false;
+bool simSleeping  = false;
+
+
+
+
+// ================== PING ==================
+static unsigned long pingTimer = 0;
+
+
+
+
+// ================== HELPERS ==================
+float getVoltage() { return ina226.getBusVoltage_V(); }
+float getCurrent() { return abs(ina226.getCurrent_mA()) / 1000.0; }
+
+
+
+
+String getDeviceID() {
+  uint64_t chipid = ESP.getEfuseMac();
+  char id[24];   // FIX-11: was 20, needs 19+null, 24 gives safe margin
+  sprintf(id, "ESP32-%04X%08X",
+          (uint16_t)(chipid >> 32),
+          (uint32_t)chipid);
+  return String(id);
+}
+
+
+
+
+// ================== STORAGE ==================
+void savePosition() {
+  prefs.putLong("rot", rotationCount);
+  prefs.putInt("angle", angle);
+  Serial.println("💾 POSITION SAVED");
+}
+
+
+
+
+void loadPosition() {
+  rotationCount = prefs.getLong("rot", 0);
+  angle         = prefs.getInt("angle", 0);
+  prevAngle     = angle;
+  totalTurns    = rotationCount + (angle / 4096.0);
+  Serial.println("📂 POSITION LOADED");
+}
+
+
+
+
+// ================== RETRY ==================
+bool isRetryActive() {
+  return (retryCount > 0 && retryCount < 3 && !lockFault);
+}
+
+
+
+
+// ================== [NEW-1] SIM POWER ==================
+void simEnterSleep() {
+  if (simSleeping) return;
+  Serial.println("📴 SIM LOW POWER");
+  SerialAT.println("AT+CFUN=4");
+  delay(2000);
+  simSleeping = true;
+}
+
+
+
+
+void simWake() {
+  if (!simSleeping) return;
+  Serial.println("📶 SIM WAKE");
+  SerialAT.println("AT+CFUN=1");
+  delay(5000);
+  simSleeping = false;
+}
+
+
+
+
+// ================== [NEW-1] SLEEP LOOP ==================
+bool sleepCommandReceived = false;
+
+
+
+
+void handleSleepMode() {
+  mqttSleepCheckTimer = millis();   // FIX-10
+  simEnterSleep();
+  Serial.println("😴 SLEEP MODE — MQTT check every 60s, SIM radio off");
+
+
+
+
+  while (true) {
+
+
+
+
+    // ── Limit switch hard-wake ──
+    if (digitalRead(LIMIT_SWITCH_PIN) == LOW) {
+
+      Serial.println("⚡ LIMIT WAKE");
+      limitOverride = true;
+
+      while (digitalRead(LIMIT_SWITCH_PIN) == LOW) {
+        mqtt.loop();
+        handleEncoder();
+
+        if (millis() - saveTimer > 2000) {
+          saveTimer = millis();
+          savePosition();
+        }
+
+        handleBuzzer();
+        delay(100);
+      }
+
+      Serial.println("✅ LIMIT RELEASED");
+      savePosition();
+      limitOverride = false;
+
+      simWake();
+      mqttRetryTimer = 0;
+      connectMQTT();
+      publishFullStatus();
+      return;
+    }
+
+
+
+
+    // ── 60s MQTT check ──
+    if (millis() - mqttSleepCheckTimer >= MQTT_SLEEP_CHECK_MS) {
+      mqttSleepCheckTimer = millis();
+      Serial.println("⏰ SLEEP CHECK — waking SIM for MQTT");
+
+      simWake();
+      mqttRetryTimer = 0;           // FIX-05
+      connectMQTT();
+
+      sleepCommandReceived = false;
+      unsigned long checkStart = millis();
+      while (millis() - checkStart < 3000) {
+        mqtt.loop();
+        delay(50);
+      }
+
+      if (sleepCommandReceived) {
+        Serial.println("🟢 COMMAND RECEIVED — WAKING");
+        return;                     // FIX-06
+      }
+
+      Serial.println("😴 NO COMMAND — SIM back to sleep");
+      simEnterSleep();
+    }
+
+
+
+
+    delay(100);
+  }
+  // FIX-06: state transitions owned by loop()'s FW_SLEEP case
+}
+
+
+
+
+// ================== SOFT START / STOP ==================
+// Ramps PWM 0 → 255 over ~2.5 s then closes bypass relay (RELAY_PWR).
+// Called only from startMotor() after direction relay is already set.
+void softStart() {
+  Serial.println("🔼 SOFT START — ramping PWM");
+  for (int duty = 0; duty <= 255; duty += 3) {
+    ledcWrite(PWM_PIN, duty);
+    delay(30);                        // ~2.55 s total ramp
+  }
+  delay(1000);                        // settle before bypass
+  Serial.println("⚡ BYPASS RELAY ON");
+  digitalWrite(RELAY_PWR, RELAY_ON); // K3 closes — transistor bypassed
+  ledcWrite(PWM_PIN, 255);            // keep transistor saturated as redundancy
+}
+
+// Ramps PWM 255 → 0 over ~2.5 s.
+// Called only from stopMotor() after bypass relay is already off.
+void softStop() {
+  Serial.println("🔽 SOFT STOP — ramping PWM down");
+  for (int duty = 255; duty >= 0; duty -= 3) {
+    ledcWrite(PWM_PIN, duty);
+    delay(30);                        // ~2.55 s total ramp
+  }
+  ledcWrite(PWM_PIN, 0);
+}
+
+
+
+
+// ================== MOTOR ==================
+
+// FIX-01: clearRelays() — kills relay power with NO side effects.
+// MERGED: also zeros PWM so transistor is off before any relay change.
+void clearRelays() {
+  ledcWrite(PWM_PIN, 0);              // MERGED: transistor off first
+  digitalWrite(RELAY_PWR, RELAY_OFF);
+  digitalWrite(RELAY_FWD, RELAY_OFF);
+  digitalWrite(RELAY_REV, RELAY_OFF);
+}
+
+void stopMotor() {
+  State stoppedFrom = motorState;   // FIX-03: capture direction BEFORE clearing
+
+  if (motorState != IDLE) {
+    resumeDirection = motorState;
+    resumePending   = true;
+
+    // ── MERGED: soft stop before killing direction relays ──
+    digitalWrite(RELAY_PWR, RELAY_OFF);  // drop bypass relay first
+    delay(100);
+    softStop();                          // ramp PWM 255 → 0
+  }
+
+  digitalWrite(RELAY_PWR, RELAY_OFF);
+  digitalWrite(RELAY_FWD, RELAY_OFF);
+  digitalWrite(RELAY_REV, RELAY_OFF);
+  ledcWrite(PWM_PIN, 0);                 // MERGED: ensure PWM is 0 after stop
+  motorState = IDLE;
+  savePosition();
+  publishPosition(stoppedFrom);         // FIX-03
+}
+
+
+
+
+void startMotor(State dir) {
+  if (vState == LOCKED) { Serial.println("🔒 BATTERY LOCKED"); return; }
+  if (lockFault)        { Serial.println("🔒 CURRENT LOCKED"); return; }
+  if (!limitOverride &&
+    dir == REVERSE_RUN &&
+    totalTurns <= MIN_TURNS){ Serial.println("⛔ REVERSE BLOCKED"); return; }
+  if (!limitOverride &&
+    dir == FORWARD_RUN &&
+    totalTurns >= MAX_TURNS){ Serial.println("⛔ FORWARD BLOCKED"); return; }
+
+  // FIX-01: shoot-through protection — clearRelays() also zeros PWM now
+  clearRelays();
+  delay(200);
+
+  // ── MERGED: set direction relay; bypass relay (RELAY_PWR) stays OFF ──
+  // softStart() will close RELAY_PWR only after PWM has fully ramped up.
+  if (dir == FORWARD_RUN) {
+    digitalWrite(RELAY_REV, RELAY_OFF); // ensure reverse off
+    digitalWrite(RELAY_FWD, RELAY_ON);  // K1 on
+  } else {
+    digitalWrite(RELAY_FWD, RELAY_OFF); // ensure forward off
+    digitalWrite(RELAY_REV, RELAY_ON);  // K2 on
+  }
+  delay(100);                           // relay settle before PWM ramp
+
+  // ── MERGED: ramp current up through transistor, then close bypass ──
+  softStart();                          // PWM 0→255 → RELAY_PWR ON
+
+  motorState    = dir;
+  lastDirection = dir;
+}
+
+
+
+
+// ================== [NEW-2] REDUCED MQTT PUBLISH FUNCTIONS ==================
+
+// FIX-03: accepts stoppedFrom so JSON correctly shows which direction motor was running
+void publishPosition(State stoppedFrom) {
+  StaticJsonDocument<160> doc;
+  doc["device_id"] = DEVICE_ID;
+  doc["turns"]     = totalTurns;
+  doc["state"]     = "IDLE";
+
+  if      (stoppedFrom == FORWARD_RUN) doc["stopped_from"] = "FORWARD";
+  else if (stoppedFrom == REVERSE_RUN) doc["stopped_from"] = "REVERSE";
+  else                                  doc["stopped_from"] = "IDLE";
+
+  String out;
+  serializeJson(doc, out);
+  if (mqtt.connected()) {                              // FIX-09
+    mqtt.publish(pubTopic.c_str(), out.c_str());
+  } else {
+    Serial.println("⚠️ MQTT not connected — position publish skipped");
+  }
+  Serial.print("📤 POS: "); Serial.println(out);
+}
+
+
+
+
+void publishVoltageEvent(String event, float v) {
+  StaticJsonDocument<128> doc;
+  doc["device_id"]     = DEVICE_ID;
+  doc["voltage_event"] = event;
+  doc["voltage_v"]     = v;
+  String out;
+  serializeJson(doc, out);
+  if (mqtt.connected()) {                              // FIX-09
+    mqtt.publish(pubTopic.c_str(), out.c_str());
+  } else {
+    Serial.println("⚠️ MQTT not connected — voltage event skipped");
+  }
+  Serial.print("📤 VOLT EVENT: "); Serial.println(out);
+}
+
+
+
+
+void publishCurrentEvent(String event, float current) {
+  StaticJsonDocument<128> doc;
+  doc["device_id"]     = DEVICE_ID;
+  doc["current_event"] = event;
+  doc["current_a"]     = current;
+  doc["threshold_a"]   = CURRENT_OFF;
+  doc["retry"]         = retryCount;
+  String out;
+  serializeJson(doc, out);
+  if (mqtt.connected()) {                              // FIX-09
+    mqtt.publish(pubTopic.c_str(), out.c_str());
+  } else {
+    Serial.println("⚠️ MQTT not connected — current event skipped");
+  }
+  Serial.print("📤 CURR EVENT: "); Serial.println(out);
+}
+
+
+
+
+void publishFullStatus() {
+  StaticJsonDocument<256> doc;
+  doc["device_id"] = DEVICE_ID;
+
+  if      (motorState == IDLE)        doc["state"] = "IDLE";
+  else if (motorState == FORWARD_RUN) doc["state"] = "FORWARD";
+  else                                doc["state"] = "REVERSE";
+
+  doc["turns"]        = totalTurns;
+  doc["fw_version"]   = FW_VERSION;
+
+  switch (vState) {
+    case NORMAL:        doc["voltage_status"] = "NORMAL";        break;
+    case WARNING:       doc["voltage_status"] = "WARNING";       break;
+    case WAIT_BYPASS:   doc["voltage_status"] = "LOW_VOLTAGE_CUT"; break;
+    case BYPASS_ACTIVE: doc["voltage_status"] = "BYPASS_ACTIVE"; break;
+    case LOCKED:        doc["voltage_status"] = "CRITICAL_LOCK"; break;
+  }
+
+  doc["oc_threshold"] = CURRENT_OFF;
+  doc["retry"]        = retryCount;
+
+  if      (lockFault)        doc["fault"] = "CURRENT_LOCK";
+  else if (vState == LOCKED) doc["fault"] = "VOLTAGE_LOCK";
+  else                       doc["fault"] = "OK";
+
+  if (updateAvailable) {
+    doc["update_available"] = true;
+    doc["update_version"]   = pendingUpdateVer;
+  }
+
+  String out;
+  serializeJson(doc, out);
+  if (mqtt.connected()) {                              // FIX-09
+    mqtt.publish(pubTopic.c_str(), out.c_str());
+  } else {
+    Serial.println("⚠️ MQTT not connected — status publish skipped");
+  }
+  Serial.print("📤 STATUS: "); Serial.println(out);
+}
+
+
+
+
+// ================== ENCODER ==================
+int readAngle() {
+  Wire.beginTransmission(AS5600_ADDR);
+  Wire.write(0x0E);
+  Wire.endTransmission(false);
+  Wire.requestFrom(AS5600_ADDR, 2);
+  if (Wire.available() == 2) {
+    int high = Wire.read();
+    int low  = Wire.read();
+    return ((high << 8) | low) & 0x0FFF;
+  }
+  return -1;
+}
+
+
+
+
+// [NEW-2] Encoder update tracks locally only; no MQTT publish here.
+void handleEncoder() {
+  int a = readAngle();
+  if (a == -1) return;
+
+  int diff = a - prevAngle;
+  if (diff >  3000) rotationCount--;
+  if (diff < -3000) rotationCount++;
+
+  prevAngle  = a;
+  angle      = a;
+  totalTurns = rotationCount + (angle / 4096.0);
+
+  if (motorState == FORWARD_RUN && totalTurns >= MAX_TURNS) {
+    Serial.println("🛑 FORWARD LIMIT REACHED");
+    stopMotor();
+  }
+  if (motorState == REVERSE_RUN && totalTurns <= MIN_TURNS) {
+    Serial.println("🛑 REVERSE LIMIT REACHED");
+    stopMotor();
+  }
+}
+
+
+
+
+// ================== LIMIT SWITCH ==================
+void handleLimit() {
+  bool limitNow = (digitalRead(LIMIT_SWITCH_PIN) == LOW);
+  if (!limitOverride &&
+    limitNow &&
+    lastLimitState == HIGH) {  // FIX-02: rising edge only
+    Serial.println("🔴 LIMIT SWITCH");
+    stopMotor();
+  }
+  lastLimitState = limitNow;   // FIX-02
+}
+
+
+
+
+// ================== CURRENT ==================
+void handleCurrent() {
+  float current = getCurrent();
+  bool  over    = current > CURRENT_OFF;
+
+  if (motorState != IDLE && over && !lastOvercurrent) {
+    Serial.println("⚠️ OVERCURRENT");
+    stopMotor();
+    retryCount++;
+    ocTripTime = millis();
+    ocFault    = true;
+    Serial.print("🔁 ATTEMPT: "); Serial.println(retryCount);
+    publishCurrentEvent("OC_TRIP", current);
+
+    if (retryCount >= 3) {
+      Serial.println("🔒 CURRENT LOCKED");
+      lockFault = true;
+      publishCurrentEvent("LOCKED", current);
+    }
+  }
+
+  lastOvercurrent = over;
+
+  if (ocFault && !lockFault && millis() - ocTripTime > RETRY_DELAY) {
+    Serial.println("🔁 RETRYING");
+    publishCurrentEvent("OC_RETRY", current);
+    startMotor(lastDirection);
+    ocFault = false;
+  }
+
+  // FIX-04: guard with !lockFault
+  static bool ocEventActive = false;
+  if (ocEventActive && !over && !ocFault && !lockFault) {
+    publishCurrentEvent("OC_RESET", current);
+    ocEventActive = false;
+  }
+  if (ocFault && !lockFault) ocEventActive = true;   // FIX-04
+}
+
+
+
+
+// ================== VOLTAGE ==================
+void handleVoltageSafety() {
+  float v = getVoltage();
+
+  if (v <= CRITICAL_V && vState != LOCKED) {
+    Serial.print("🛑 CRITICAL VOLTAGE: "); Serial.print(v, 2); Serial.println("V → LOCK");
+    stopMotor();
+    vState = LOCKED;
+    publishVoltageEvent("LOCKED", v);
+    return;
+  }
+
+  if (vState == LOCKED) {
+    if (v >= RESET_V) {
+      Serial.println("🔄 VOLTAGE RESTORED");
+      vState = NORMAL;
+      publishVoltageEvent("NORMAL", v);
+    }
+    return;
+  }
+
+  if (vState == BYPASS_ACTIVE) {
+    if (v <= CRITICAL_V) {
+      Serial.print("🛑 BYPASS STOPPED AT "); Serial.print(v, 2); Serial.println("V");
+      stopMotor();
+      vState = LOCKED;
+      publishVoltageEvent("LOCKED", v);
+      return;
+    }
+    if (v >= RESET_V) {
+      Serial.println("🔄 VOLTAGE RECOVERED");
+      vState = NORMAL;
+      publishVoltageEvent("NORMAL", v);
+    }
+    return;
+  }
+
+  if (vState == WAIT_BYPASS) return;
+
+  if (v < WARN_V_LOW) {
+    if (vState == NORMAL) {
+      vState = WARNING;
+      warnPrintTimer = 0;
+      publishVoltageEvent("WARNING", v);
+    }
+    if (millis() - warnPrintTimer > 5000) {
+      warnPrintTimer = millis();
+      Serial.print("⚠️ VOLTAGE WARNING: "); Serial.print(v, 2); Serial.println("V");
+    }
+  } else if (v > WARN_V_HIGH && vState == WARNING) {
+    Serial.print("✅ VOLTAGE NORMAL: "); Serial.print(v, 2); Serial.println("V");
+    vState = NORMAL;
+    publishVoltageEvent("NORMAL", v);
+  }
+
+  if (v < CUT_V && motorState != IDLE && vState != WAIT_BYPASS) {
+    Serial.print("🛑 LOW VOLTAGE CUT: "); Serial.print(v, 2); Serial.println("V");
+    stopMotor();
+    Serial.println("BYPASS? Y/N");
+    vState = WAIT_BYPASS;
+    publishVoltageEvent("CUT", v);
+  }
+}
+
+
+
+
+// ================== BUZZER (UNCHANGED) ==================
+void handleBuzzer() {
+
+  bool limitActive = (digitalRead(LIMIT_SWITCH_PIN) == LOW);
+
+  if (!limitActive) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    buzzerTimer = millis();
+    return;
+  }
+
+  int mode = 1;
+
+  if      (totalTurns <= MIN_TURNS) mode = 2;
+  else if (totalTurns >= MAX_TURNS) mode = 3;
+
+  unsigned long now     = millis();
+  unsigned long elapsed = now - buzzerTimer;
+
+  // ── SINGLE BEEP ──
+  if (mode == 1) {
+    if      (elapsed < 150) digitalWrite(BUZZER_PIN, LOW);
+    else if (elapsed < 600) digitalWrite(BUZZER_PIN, HIGH);
+    else                    buzzerTimer = now;
+  }
+
+  // ── DOUBLE BEEP ──
+  else if (mode == 2) {
+    if      (elapsed < 150)  digitalWrite(BUZZER_PIN, LOW);
+    else if (elapsed < 300)  digitalWrite(BUZZER_PIN, HIGH);
+    else if (elapsed < 450)  digitalWrite(BUZZER_PIN, LOW);
+    else if (elapsed < 600)  digitalWrite(BUZZER_PIN, HIGH);
+    else if (elapsed >= 1100) buzzerTimer = now;
+  }
+
+  // ── TRIPLE BEEP ──
+  else if (mode == 3) {
+    if      (elapsed < 150)  digitalWrite(BUZZER_PIN, LOW);
+    else if (elapsed < 300)  digitalWrite(BUZZER_PIN, HIGH);
+    else if (elapsed < 450)  digitalWrite(BUZZER_PIN, LOW);
+    else if (elapsed < 600)  digitalWrite(BUZZER_PIN, HIGH);
+    else if (elapsed < 750)  digitalWrite(BUZZER_PIN, LOW);
+    else if (elapsed < 900)  digitalWrite(BUZZER_PIN, HIGH);
+    else if (elapsed >= 1400) buzzerTimer = now;
+  }
+}
+
+
+
+
+// ================== [NEW-3+4] JSON COMMAND HANDLER ==================
+void handleJSONCommand(String input) {
+
+  StaticJsonDocument<256> doc;
+
+  if (deserializeJson(doc, input)) {
+    Serial.println("❌ JSON ERROR");
+    return;
+  }
+
+  String id = doc["device_id"];
+  if (id != DEVICE_ID) return;
+
+  String cmd = doc["cmd"];
+
+  // ── Motor commands ──
+  if      (cmd == "F") startMotor(FORWARD_RUN);
+  else if (cmd == "R") startMotor(REVERSE_RUN);
+  else if (cmd == "S") stopMotor();
+
+  // ── Bypass ──
+  else if (vState == WAIT_BYPASS) {
+    if (cmd == "Y") {
+      Serial.println("⚠️ BYPASS ENABLED");
+      vState = BYPASS_ACTIVE;
+      publishVoltageEvent("BYPASS", getVoltage());
+      if (resumePending) {
+        Serial.println("🔁 RESUMING");
+        startMotor(resumeDirection);
+        resumePending = false;
+      }
+    } else if (cmd == "N") {
+      Serial.println("❌ BYPASS DENIED");
+      vState = WARNING;
+    }
+  }
+
+  // [NEW-3] ── SET_CURRENT ──
+  else if (cmd == "SET_CURRENT") {
+    float newVal = doc["value"] | CURRENT_OFF;
+    if (newVal > 0.1 && newVal < 10.0) {
+      CURRENT_OFF = newVal;
+      prefs.putFloat("oc_thresh", CURRENT_OFF);
+      lockFault  = false;
+      ocFault    = false;
+      retryCount = 0;
+      Serial.print("⚡ OC THRESHOLD SET: "); Serial.print(CURRENT_OFF, 2); Serial.println("A");
+      Serial.println("🔓 CURRENT LOCK CLEARED");
+      publishCurrentEvent("THRESHOLD_SET", getCurrent());
+    } else {
+      Serial.println("❌ INVALID CURRENT VALUE");
+    }
+  }
+
+  // [NEW-3] ── GET_STATUS ──
+  else if (cmd == "GET_STATUS") {
+    publishFullStatus();
+    sleepCommandReceived = true;
+  }
+
+  else if (cmd == "CHECK_UPDATE") {
+    if (updateAvailable) {
+      StaticJsonDocument<128> upd;
+      upd["device_id"]        = DEVICE_ID;
+      upd["update_available"] = true;
+      upd["update_version"]   = pendingUpdateVer;
+      upd["current_version"]  = FW_VERSION;
+      String out; serializeJson(upd, out);
+      if (mqtt.connected()) mqtt.publish(pubTopic.c_str(), out.c_str());  // FIX-09
+      Serial.println("📤 UPDATE INFO SENT");
+    } else {
+      StaticJsonDocument<96> upd;
+      upd["device_id"]        = DEVICE_ID;
+      upd["update_available"] = false;
+      upd["current_version"]  = FW_VERSION;
+      String out; serializeJson(upd, out);
+      if (mqtt.connected()) mqtt.publish(pubTopic.c_str(), out.c_str());  // FIX-09
+      Serial.println("📤 NO UPDATE AVAILABLE");
+    }
+    sleepCommandReceived = true;
+  }
+
+  // [NEW-4] ── DO_UPDATE ──
+  else if (cmd == "DO_UPDATE") {
+    if (updateAvailable && pendingUpdateURL.length() > 0) {
+      Serial.println("🚀 OTA UPDATE ACCEPTED");
+      Serial.print("🔗 URL: "); Serial.println(pendingUpdateURL);
+      // performOTA(stream, contentLength);  ← wire up HTTPClient stream here
+    } else {
+      Serial.println("❌ NO UPDATE PENDING");
+    }
+    sleepCommandReceived = true;
+  }
+
+  else {
+    sleepCommandReceived = true;
+  }
+}
+
+
+
+
+// ================== [NEW-4] UPDATE TOPIC HANDLER ==================
+void handleUpdatePayload(String payload) {
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, payload)) return;
+
+  String version = doc["version"] | "";
+  String url     = doc["url"]     | "";
+
+  if (version.length() == 0) return;
+
+  if (version != FW_VERSION) {
+    updateAvailable  = true;
+    pendingUpdateVer = version;
+    pendingUpdateURL = url;
+
+    Serial.print("🆕 UPDATE AVAILABLE: v"); Serial.print(version);
+    Serial.print(" (current: v"); Serial.print(FW_VERSION); Serial.println(")");
+
+    StaticJsonDocument<160> notif;
+    notif["device_id"]        = DEVICE_ID;
+    notif["update_available"] = true;
+    notif["update_version"]   = version;
+    notif["current_version"]  = FW_VERSION;
+    notif["note"]             = "Send DO_UPDATE to install";
+    String out; serializeJson(notif, out);
+    if (mqtt.connected()) mqtt.publish(pubTopic.c_str(), out.c_str());  // FIX-09
+
+    sleepCommandReceived = true;
+  } else {
+    Serial.println("✅ FIRMWARE UP TO DATE");
+    updateAvailable = false;
+  }
+}
+
+
+
+
+// ================== DASHBOARD ==================
+void printDashboard() {
+  if (millis() - dashboardTimer < 2000) return;
+  dashboardTimer = millis();
+
+  Serial.println("================================");
+  Serial.print("Voltage: "); Serial.print(getVoltage(), 2);
+  Serial.print(" V | Current: "); Serial.print(getCurrent(), 3);
+  Serial.print(" A | Turns: "); Serial.println(totalTurns, 2);
+
+  Serial.print("State: ");
+  if      (motorState == IDLE)        Serial.print("IDLE");
+  else if (motorState == FORWARD_RUN) Serial.print("FORWARD");
+  else                                Serial.print("REVERSE");
+
+  Serial.print(" | Retry: "); Serial.print(retryCount);
+  Serial.print(" | Fault: ");
+  if      (lockFault)        Serial.print("CURRENT_LOCK");
+  else if (vState == LOCKED) Serial.print("VOLTAGE_LOCK");
+  else                       Serial.print("OK");
+
+  Serial.print(" | V_State: ");
+  switch (vState) {
+    case NORMAL:        Serial.print("NORMAL");        break;
+    case WARNING:       Serial.print("WARNING");       break;
+    case WAIT_BYPASS:   Serial.print("WAIT_BYPASS");   break;
+    case BYPASS_ACTIVE: Serial.print("BYPASS_ACTIVE"); break;
+    case LOCKED:        Serial.print("LOCKED");        break;
+  }
+
+  Serial.print(" | OC_THRESH: "); Serial.print(CURRENT_OFF, 2); Serial.print("A");
+  if (updateAvailable) { Serial.print(" | 🆕 UPDATE v"); Serial.print(pendingUpdateVer); }
+  Serial.println();
+  Serial.println("================================");
+}
+
+
+
+
+// ================== OTA ==================
+void performOTA(Stream &s, int contentLength) {
+  Serial.println("🚀 OTA START");
+  if (!Update.begin(contentLength)) { Serial.println("❌ OTA BEGIN FAILED"); return; }
+  size_t written = Update.writeStream(s);
+  if (written == contentLength) Serial.println("✅ OTA WRITTEN");
+  else                          Serial.println("❌ OTA WRITE FAILED");
+  if (Update.end()) { Serial.println("🔁 RESTARTING..."); ESP.restart(); }
+  else              Serial.println("❌ OTA END FAILED");
+}
+
+
+
+
+// ================== LTE ==================
+void initLTE() {
+  Serial.println("📡 INIT LTE...");
+  SerialAT.begin(115200, SERIAL_8N1, 16, 17);
+  delay(5000);
+
+  SerialAT.println("AT");       delay(1000); while (SerialAT.available()) Serial.write(SerialAT.read());
+  SerialAT.println("AT+CPIN?"); delay(1000); while (SerialAT.available()) Serial.write(SerialAT.read());
+  SerialAT.println("AT+CSQ");   delay(1000); while (SerialAT.available()) Serial.write(SerialAT.read());
+
+  bool networkReady = false;
+  for (int i = 0; i < 20; i++) {
+    SerialAT.println("AT+CREG?"); delay(2000);
+    String resp = "";
+    while (SerialAT.available()) resp += char(SerialAT.read());
+    Serial.println(resp);
+    if (resp.indexOf("0,1") != -1 || resp.indexOf("0,5") != -1) {
+      Serial.println("✅ NETWORK REGISTERED"); networkReady = true; break;
+    }
+    Serial.println("⏳ WAITING FOR NETWORK...");
+  }
+  if (!networkReady) { Serial.println("❌ NETWORK FAILED"); return; }
+
+  SerialAT.println("AT+CGATT=1");                        delay(3000); while (SerialAT.available()) Serial.write(SerialAT.read());
+  SerialAT.println("AT+CGDCONT=1,\"IP\",\"iot.com\"");  delay(2000); while (SerialAT.available()) Serial.write(SerialAT.read());
+  SerialAT.println("AT+CGACT=1,1");                      delay(5000); while (SerialAT.available()) Serial.write(SerialAT.read());
+  SerialAT.println("AT+CGPADDR=1");                      delay(2000); while (SerialAT.available()) Serial.write(SerialAT.read());
+
+  Serial.println("🌐 TESTING INTERNET...");
+  SerialAT.println("AT+QPING=1,\"8.8.8.8\""); delay(5000); while (SerialAT.available()) Serial.write(SerialAT.read());
+  Serial.println("✅ LTE READY");
+}
+
+
+
+
+void handleLTE() {
+  while (SerialAT.available()) Serial.write(SerialAT.read());
+}
+
+
+
+
+// ================== MQTT ==================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg = "";
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  Serial.println("📩 MQTT MSG:"); Serial.println(msg);
+
+  String t = String(topic);
+
+  if (t == updateTopic) {
+    handleUpdatePayload(msg);
+  } else {
+    handleJSONCommand(msg);
+  }
+}
+
+
+
+
+void connectMQTT() {
+  if (mqtt.connected()) return;
+  if (millis() - mqttRetryTimer < 5000) return;
+  mqttRetryTimer = millis();
+  Serial.println("🌐 MQTT CONNECTING...");
+  mqtt.setServer(mqttServer, mqttPort);
+  mqtt.setCallback(mqttCallback);
+  if (mqtt.connect(DEVICE_ID.c_str())) {
+    Serial.println("✅ MQTT CONNECTED");
+    mqtt.subscribe(subTopic.c_str());
+    mqtt.subscribe(updateTopic.c_str());
+    Serial.print("📡 SUBSCRIBED CMD:    "); Serial.println(subTopic);
+    Serial.print("📡 SUBSCRIBED UPDATE: "); Serial.println(updateTopic);
+    publishFullStatus();
+  } else {
+    Serial.print("❌ MQTT FAILED: "); Serial.println(mqtt.state());
+  }
+}
+
+
+
+
+// ================== SETUP ==================
+void setup() {
+  Serial.begin(115200);
+  DEVICE_ID   = getDeviceID();
+  pubTopic    = "actuator/" + DEVICE_ID + "/status";
+  subTopic    = "actuator/" + DEVICE_ID + "/cmd";
+  updateTopic = "actuator/" + DEVICE_ID + "/update";
+
+  initLTE();
+  connectMQTT();
+
+  Serial.print("📌 DEVICE ID: "); Serial.println(DEVICE_ID);
+  Serial.print("📌 FW VER:    "); Serial.println(FW_VERSION);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // ── Existing relay + IO pins — UNCHANGED ──
+  pinMode(RELAY_PWR,        OUTPUT);
+  pinMode(RELAY_FWD,        OUTPUT);
+  pinMode(RELAY_REV,        OUTPUT);
+  pinMode(LIMIT_SWITCH_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN,       OUTPUT);
+
+  digitalWrite(RELAY_PWR,  RELAY_OFF);
+  digitalWrite(RELAY_FWD,  RELAY_OFF);
+  digitalWrite(RELAY_REV,  RELAY_OFF);
+  digitalWrite(BUZZER_PIN, HIGH);
+
+  // ── MERGED: soft-start PWM channel ──
+  ledcAttach(PWM_PIN, PWM_FREQ, PWM_RES);  // GPIO25, 5 kHz, 8-bit
+  ledcWrite(PWM_PIN, 0);                    // transistor off at boot
+  Serial.println("✅ SOFT START PWM READY (GPIO25)");
+
+  ina226.init();
+  prefs.begin("encoder", false);
+  loadPosition();
+
+  // [NEW-3] Restore saved OC threshold
+  CURRENT_OFF = prefs.getFloat("oc_thresh", 1.0);
+  Serial.print("⚡ OC THRESHOLD: "); Serial.print(CURRENT_OFF, 2); Serial.println("A");
+
+  Serial.println("✅ SYSTEM READY");
+}
+
+
+
+
+// ================== LOOP ==================
+void loop() {
+  switch (fwState) {
+
+    case FW_INIT:
+      Serial.println("🚀 FW INIT → ACTIVE");
+      fwState = FW_ACTIVE;
+      break;
+
+    case FW_ACTIVE:
+
+      // 🔴 BYPASS DELAY SLEEP
+      if (bypassSleepPending) {
+        if (millis() - bypassSleepTimer >= 30000) {
+          Serial.println("😴 ENTERING SLEEP");
+          bypassSleepPending = false;
+          sleepMode = true;
+          fwState   = FW_SLEEP;
+        }
+      }
+
+      // ── IDLE TIMEOUT → SLEEP ──
+      if (motorState == IDLE && !isRetryActive()) {
+        if (!idleTracking) {
+          idleTracking = true;
+          idleStart    = millis();
+        }
+        if (!sleepMode && millis() - idleStart > 10000) {
+          Serial.println("💾 PRE-SLEEP SAVE");
+          savePosition();
+          sleepMode = true;
+        }
+      } else {
+        idleTracking = false;
+      }
+
+      if (sleepMode) { fwState = FW_SLEEP; break; }
+
+      // ── SERIAL INPUT ──
+      if (Serial.available()) {
+        String input = Serial.readStringUntil('\n');
+        input.trim();
+        if (input.startsWith("{")) {
+          handleJSONCommand(input);
+        } else {
+          input.toUpperCase();
+          Serial.print("📩 CMD: "); Serial.println(input);
+          if      (input == "F") startMotor(FORWARD_RUN);
+          else if (input == "R") startMotor(REVERSE_RUN);
+          else if (input == "S") stopMotor();
+          else if (vState == WAIT_BYPASS) {
+            if (input == "Y") {
+              vState = BYPASS_ACTIVE;
+              publishVoltageEvent("BYPASS", getVoltage());
+              if (resumePending) { startMotor(resumeDirection); resumePending = false; }
+            } else {
+              vState = WARNING;
+            }
+          }
+        }
+      }
+
+      connectMQTT();
+      mqtt.loop();
+
+      handleEncoder();
+      handleLimit();
+      handleCurrent();
+      handleVoltageSafety();
+      handleBuzzer();      // [UNCHANGED]
+      printDashboard();
+      handleLTE();
+      break;
+
+    // [NEW-1] FW_SLEEP: MQTT-driven, SIM low-power
+    case FW_SLEEP:
+      handleSleepMode();   // blocks until wake command or limit switch
+      sleepMode    = false;
+      idleTracking = false;
+      idleStart    = millis();
+      fwState      = FW_ACTIVE;
+      break;
+  }
+}
