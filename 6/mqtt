@@ -3,10 +3,6 @@
 
 
 
-
-
-
-
 #include <Wire.h>
 #include <INA226_WE.h>
 #include <Preferences.h>
@@ -95,7 +91,7 @@ enum FirmwareState {
 FirmwareState fwState = FW_INIT;
 
 
-// ================== SOFT START ==================
+// ================== SOFT START CONFIG ==================
 #define SOFT_START_DELAY 3000      // 3 seconds ramp-up time
 #define SOFT_START_STOP_DELAY 2000 // 2 seconds stop delay
 #define PWM_FREQUENCY 5000         // 5kHz PWM
@@ -114,6 +110,8 @@ unsigned long softStartStopTimer = 0;
 #define MAX_TURNS 10.0
 
 
+
+
 // ================== VOLTAGE ==================
 #define WARN_V_LOW  10.7
 #define WARN_V_HIGH 11.0
@@ -122,13 +120,18 @@ unsigned long softStartStopTimer = 0;
 #define RESET_V    11.0
 
 
+
+
 enum VoltageState { NORMAL, WARNING, WAIT_BYPASS, BYPASS_ACTIVE, LOCKED };
 VoltageState vState = NORMAL;
+
+
 
 
 // ================== CURRENT ==================
 #define CURRENT_OFF 1.0
 #define RETRY_DELAY 30000
+
 
 
 
@@ -138,19 +141,27 @@ bool lockFault = false;
 unsigned long ocTripTime = 0;
 
 
+
+
 // ================== ENCODER ==================
 int16_t angle = 0, prevAngle = 0;
 long rotationCount = 0;
 float totalTurns = 0;
 
 
+
+
 // ================== BUZZER ==================
 unsigned long buzzerTimer = 0;
+
+
 
 
 // ================== FLAGS ==================
 bool lastLimitState = HIGH;
 bool lastOvercurrent = false;
+
+
 
 
 // ================== TIMERS ==================
@@ -159,10 +170,14 @@ unsigned long lowVoltStart = 0;
 bool lowVoltDetected = false;
 
 
+
+
 // ================== SLEEP ==================
 bool sleepMode = false;
 bool idleTracking = false;
 unsigned long idleStart = 0;
+
+
 
 
 // ================== HELPERS ==================
@@ -196,6 +211,8 @@ void loadPosition() {
   totalTurns = rotationCount + (angle / 4096.0);
   Serial.println("📂 POSITION LOADED");
 }
+
+
 
 
 // ================== RETRY ==================
@@ -256,13 +273,13 @@ void handleSoftStart() {
       // Calculate PWM value (0-255) based on elapsed time
       uint8_t pwmValue = (uint8_t)((elapsed * 255) / SOFT_START_DELAY);
       ledcWrite(PWM_CHANNEL, pwmValue);
-      // Serial.print("⚡ PWM: "); Serial.println(pwmValue);
     }
   }
 }
 
 // ================== TIMED SLEEP ==================
 void timedPseudoSleep() {
+
 
 
 
@@ -275,11 +292,8 @@ void timedPseudoSleep() {
 
 
 
-
     if (millis() - start >= 60000) {
 
 
 
       Serial.println("⏰ WAKE CHECK");
-
-
