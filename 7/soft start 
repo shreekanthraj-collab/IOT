@@ -1,0 +1,174 @@
+/*
+  RS775 Soft Start Test
+  ESP32 DevKit
+
+  F = Forward
+  R = Reverse
+  S = Stop
+*/
+
+#define PWM_PIN     25     // BC847B base through 1k resistor
+
+#define K1_RELAY    27     // Forward relay
+#define K2_RELAY    14     // Reverse relay
+#define K3_RELAY    26     // Main bypass relay
+
+#define PWM_FREQ    5000
+#define PWM_RES     8
+
+bool motorRunning = false;
+bool motorForward = true;
+
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(K1_RELAY, OUTPUT);
+  pinMode(K2_RELAY, OUTPUT);
+  pinMode(K3_RELAY, OUTPUT);
+
+  digitalWrite(K1_RELAY, LOW);
+  digitalWrite(K2_RELAY, LOW);
+  digitalWrite(K3_RELAY, LOW);
+
+  ledcAttach(PWM_PIN, PWM_FREQ, PWM_RES);
+  ledcWrite(PWM_PIN, 0);
+
+  Serial.println();
+  Serial.println("===== RS775 SOFT START TEST =====");
+  Serial.println("F = Forward");
+  Serial.println("R = Reverse");
+  Serial.println("S = Stop");
+}
+
+void loop()
+{
+  if (Serial.available())
+  {
+    char cmd = toupper(Serial.read());
+
+    switch (cmd)
+    {
+      case 'F':
+        startForward();
+        break;
+
+      case 'R':
+        startReverse();
+        break;
+
+      case 'S':
+        stopMotor();
+        break;
+    }
+  }
+}
+
+/* =========================
+      FORWARD START
+   ========================= */
+void startForward()
+{
+  if (motorRunning)
+  {
+    Serial.println("Already Running");
+    return;
+  }
+
+  Serial.println("FORWARD START");
+
+  digitalWrite(K2_RELAY, LOW);
+  delay(100);
+
+  digitalWrite(K1_RELAY, HIGH);
+  delay(100);
+
+  digitalWrite(K3_RELAY, LOW);
+
+  softStart();
+
+  motorRunning = true;
+  motorForward = true;
+}
+
+/* =========================
+      REVERSE START
+   ========================= */
+void startReverse()
+{
+  if (motorRunning)
+  {
+    Serial.println("Already Running");
+    return;
+  }
+
+  Serial.println("REVERSE START");
+
+  digitalWrite(K1_RELAY, LOW);
+  delay(100);
+
+  digitalWrite(K2_RELAY, HIGH);
+  delay(100);
+
+  digitalWrite(K3_RELAY, LOW);
+
+  softStart();
+
+  motorRunning = true;
+  motorForward = false;
+}
+
+/* =========================
+        SOFT START
+   ========================= */
+void softStart()
+{
+  Serial.println("Soft Start");
+
+  for (int duty = 0; duty <= 255; duty += 3)
+  {
+    ledcWrite(PWM_PIN, duty);
+    delay(30);
+  }
+
+  delay(1000);
+
+  Serial.println("Main Relay ON");
+
+  digitalWrite(K3_RELAY, HIGH);
+
+  ledcWrite(PWM_PIN, 255);
+}
+
+/* =========================
+         STOP
+   ========================= */
+void stopMotor()
+{
+  if (!motorRunning)
+  {
+    Serial.println("Motor Already Stopped");
+    return;
+  }
+
+  Serial.println("STOP");
+
+  digitalWrite(K3_RELAY, LOW);
+
+  delay(100);
+
+  for (int duty = 255; duty >= 0; duty -= 3)
+  {
+    ledcWrite(PWM_PIN, duty);
+    delay(30);
+  }
+
+  digitalWrite(K1_RELAY, LOW);
+  digitalWrite(K2_RELAY, LOW);
+
+  ledcWrite(PWM_PIN, 0);
+
+  motorRunning = false;
+
+  Serial.println("Motor Stopped");
+}
