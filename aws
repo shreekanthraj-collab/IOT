@@ -1,0 +1,362 @@
+// ================== AWS PROVISIONING SKETCH v1.0.0 ==================
+// ESP32-S3 Municipal Actuator — Session 1
+//
+// PURPOSE:
+//   One-time provisioning tool. Flash this sketch to the ESP32-S3,
+//   open Serial Monitor at 115200, paste credentials when prompted.
+//   Once complete, flash the main AWS firmware — credentials persist in NVS.
+//
+// NVS NAMESPACE: "aws_creds"
+//   Key           Max size    Content
+//   "endpoint"    256 B       AWS IoT Core endpoint (xxx.iot.region.amazonaws.com)
+//   "cert"        2048 B      Device certificate PEM
+//   "pkey"        2048 B      Device private key PEM
+//   "rootca"      2048 B      AWS Root CA PEM
+//   "jitp_cert"   2048 B      Claim certificate PEM (JITP — optional)
+//   "jitp_pkey"   2048 B      Claim private key PEM (JITP — optional)
+//   "device_id"   64 B        Override device ID (default = ESP eFuse MAC)
+//   "fw_ver"      16 B        Written by main firmware on each boot
+//
+// NVS NAMESPACE: "device_cfg"
+//   Key           Max size    Content
+//   "max_turns"   float       Runtime max turns (default 10.0)
+//   "oc_thresh"   float       OC threshold amps (default 1.0)
+//   "boot_check"  32 B        OTA rollback flag
+//
+// PROVISIONING COMMANDS (type in Serial Monitor):
+//   WRITE_ENDPOINT   — paste AWS IoT endpoint
+//   WRITE_CERT       — paste device certificate PEM (end with END_PEM)
+//   WRITE_PKEY       — paste private key PEM (end with END_PEM)
+//   WRITE_ROOTCA     — paste root CA PEM (end with END_PEM)
+//   WRITE_JITP_CERT  — paste claim certificate PEM (end with END_PEM)
+//   WRITE_JITP_PKEY  — paste claim private key PEM (end with END_PEM)
+//   WRITE_DEVICE_ID  — paste custom device ID string
+//   READ_ALL         — print all stored values (certs truncated to 64 chars)
+//   VERIFY           — check all required keys are present and non-empty
+//   CLEAR_ALL        — erase entire aws_creds namespace
+//   CLEAR_JITP       — erase only JITP claim credentials
+// =====================================================================
+
+
+
+
+#include <Preferences.h>
+
+
+
+
+Preferences prefs;
+
+
+
+
+// ================== HELPERS ==================
+
+String getDeviceID() {
+  uint64_t chipid = ESP.getEfuseMac();
+  char id[24];
+  sprintf(id, "ESP32S3-%04X%08X",
+          (uint16_t)(chipid >> 32),
+          (uint32_t)chipid);
+  return String(id);
+}
+
+// Read a multiline PEM block from Serial until "END_PEM" sentinel
+String readPEM(String label) {
+  Serial.print("📋 Paste "); Serial.print(label);
+  Serial.println(" PEM below, then type END_PEM on its own line:");
+  String pem    = "";
+  bool   started = false;
+  unsigned long timeout = millis() + 120000UL;   // 2 min timeout
+
+  while (millis() < timeout) {
+    if (Serial.available()) {
+      String line = Serial.readStringUntil('\n');
+      line.trim();
+
+      if (line == "END_PEM") break;
+
+      if (line.length() > 0) {
+        if (!started) started = true;
+        pem += line + "\n";
+      }
+    }
+  }
+
+  if (!started) {
+    Serial.println("⚠️  No input received — operation cancelled");
+    return "";
+  }
+
+  return pem;
+}
+
+// Read a single-line value from Serial
+String readLine(String label) {
+  Serial.print("📋 Enter "); Serial.print(label); Serial.println(":");
+  unsigned long timeout = millis() + 60000UL;
+  while (millis() < timeout) {
+    if (Serial.available()) {
+      String val = Serial.readStringUntil('\n');
+      val.trim();
+      if (val.length() > 0) return val;
+    }
+  }
+  Serial.println("⚠️  Timeout — operation cancelled");
+  return "";
+}
+
+void printTruncated(String label, String val) {
+  Serial.print("  "); Serial.print(label); Serial.print(": ");
+  if (val.length() == 0) {
+    Serial.println("[EMPTY]");
+  } else if (val.length() <= 64) {
+    Serial.println(val);
+  } else {
+    Serial.print(val.substring(0, 64));
+    Serial.print("... ["); Serial.print(val.length()); Serial.println(" bytes total]");
+  }
+}
+
+
+
+
+// ================== NVS WRITE FUNCTIONS ==================
+
+void writeEndpoint() {
+  String val = readLine("AWS IoT endpoint (e.g. xxxx.iot.eu-west-1.amazonaws.com)");
+  if (val.length() == 0) return;
+  prefs.begin("aws_creds", false);
+  prefs.putString("endpoint", val);
+  prefs.end();
+  Serial.println("✅ endpoint saved");
+}
+
+void writeCert() {
+  String pem = readPEM("Device Certificate");
+  if (pem.length() == 0) return;
+  if (pem.length() > 2048) { Serial.println("❌ Certificate too large (max 2048 bytes)"); return; }
+  prefs.begin("aws_creds", false);
+  prefs.putString("cert", pem);
+  prefs.end();
+  Serial.print("✅ cert saved ("); Serial.print(pem.length()); Serial.println(" bytes)");
+}
+
+void writePkey() {
+  String pem = readPEM("Private Key");
+  if (pem.length() == 0) return;
+  if (pem.length() > 2048) { Serial.println("❌ Private key too large (max 2048 bytes)"); return; }
+  prefs.begin("aws_creds", false);
+  prefs.putString("pkey", pem);
+  prefs.end();
+  Serial.print("✅ pkey saved ("); Serial.print(pem.length()); Serial.println(" bytes)");
+}
+
+void writeRootCA() {
+  String pem = readPEM("AWS Root CA");
+  if (pem.length() == 0) return;
+  if (pem.length() > 2048) { Serial.println("❌ Root CA too large (max 2048 bytes)"); return; }
+  prefs.begin("aws_creds", false);
+  prefs.putString("rootca", pem);
+  prefs.end();
+  Serial.print("✅ rootca saved ("); Serial.print(pem.length()); Serial.println(" bytes)");
+}
+
+void writeJITPCert() {
+  String pem = readPEM("JITP Claim Certificate");
+  if (pem.length() == 0) return;
+  if (pem.length() > 2048) { Serial.println("❌ JITP cert too large (max 2048 bytes)"); return; }
+  prefs.begin("aws_creds", false);
+  prefs.putString("jitp_cert", pem);
+  prefs.end();
+  Serial.print("✅ jitp_cert saved ("); Serial.print(pem.length()); Serial.println(" bytes)");
+}
+
+void writeJITPPkey() {
+  String pem = readPEM("JITP Claim Private Key");
+  if (pem.length() == 0) return;
+  if (pem.length() > 2048) { Serial.println("❌ JITP key too large (max 2048 bytes)"); return; }
+  prefs.begin("aws_creds", false);
+  prefs.putString("jitp_pkey", pem);
+  prefs.end();
+  Serial.print("✅ jitp_pkey saved ("); Serial.print(pem.length()); Serial.println(" bytes)");
+}
+
+void writeDeviceID() {
+  String val = readLine("Custom Device ID (leave blank to use eFuse MAC default)");
+  if (val.length() == 0) return;
+  if (val.length() > 64) { Serial.println("❌ Device ID too long (max 64 chars)"); return; }
+  prefs.begin("aws_creds", false);
+  prefs.putString("device_id", val);
+  prefs.end();
+  Serial.print("✅ device_id saved: "); Serial.println(val);
+}
+
+
+
+
+// ================== NVS READ FUNCTIONS ==================
+
+void readAll() {
+  prefs.begin("aws_creds", true);
+  String endpoint  = prefs.getString("endpoint",  "");
+  String cert      = prefs.getString("cert",      "");
+  String pkey      = prefs.getString("pkey",      "");
+  String rootca    = prefs.getString("rootca",    "");
+  String jitpCert  = prefs.getString("jitp_cert", "");
+  String jitpPkey  = prefs.getString("jitp_pkey", "");
+  String deviceId  = prefs.getString("device_id", "");
+  prefs.end();
+
+  prefs.begin("device_cfg", true);
+  float maxTurns  = prefs.getFloat("max_turns",  10.0);
+  float ocThresh  = prefs.getFloat("oc_thresh",   1.0);
+  String bootChk  = prefs.getString("boot_check", "OK");
+  prefs.end();
+
+  Serial.println("\n========== NVS CONTENTS ==========");
+  Serial.println("── aws_creds ──");
+  printTruncated("endpoint ", endpoint);
+  printTruncated("cert     ", cert);
+  printTruncated("pkey     ", pkey);
+  printTruncated("rootca   ", rootca);
+  printTruncated("jitp_cert", jitpCert);
+  printTruncated("jitp_pkey", jitpPkey);
+  printTruncated("device_id", deviceId);
+  Serial.println("── device_cfg ──");
+  Serial.print("  max_turns:  "); Serial.println(maxTurns, 2);
+  Serial.print("  oc_thresh:  "); Serial.println(ocThresh, 2);
+  Serial.print("  boot_check: "); Serial.println(bootChk);
+  Serial.println("===================================\n");
+}
+
+
+
+
+// ================== VERIFY ==================
+
+void verifyCredentials() {
+  prefs.begin("aws_creds", true);
+  String endpoint = prefs.getString("endpoint",  "");
+  String cert     = prefs.getString("cert",      "");
+  String pkey     = prefs.getString("pkey",      "");
+  String rootca   = prefs.getString("rootca",    "");
+  prefs.end();
+
+  Serial.println("\n========== VERIFICATION ==========");
+  bool pass = true;
+
+  auto check = [&](String label, String val, String mustContain) {
+    bool ok = (val.length() > 0 && val.indexOf(mustContain) != -1);
+    Serial.print(ok ? "  ✅ " : "  ❌ ");
+    Serial.print(label); Serial.print(": ");
+    Serial.println(ok ? "OK" : "MISSING or INVALID");
+    if (!ok) pass = false;
+  };
+
+  check("endpoint", endpoint, ".amazonaws.com");
+  check("cert    ", cert,     "-----BEGIN CERTIFICATE-----");
+  check("pkey    ", pkey,     "-----BEGIN");
+  check("rootca  ", rootca,   "-----BEGIN CERTIFICATE-----");
+
+  Serial.println("──────────────────────────────────");
+  Serial.println(pass ? "✅ ALL REQUIRED CREDENTIALS PRESENT"
+                      : "❌ PROVISIONING INCOMPLETE");
+  Serial.println("===================================\n");
+}
+
+
+
+
+// ================== CLEAR ==================
+
+void clearAll() {
+  Serial.println("⚠️  Type CONFIRM to erase all aws_creds:");
+  String confirm = readLine("confirmation");
+  if (confirm != "CONFIRM") { Serial.println("❌ Cancelled"); return; }
+  prefs.begin("aws_creds", false);
+  prefs.clear();
+  prefs.end();
+  Serial.println("✅ aws_creds namespace cleared");
+}
+
+void clearJITP() {
+  prefs.begin("aws_creds", false);
+  prefs.remove("jitp_cert");
+  prefs.remove("jitp_pkey");
+  prefs.end();
+  Serial.println("✅ JITP credentials cleared");
+}
+
+
+
+
+// ================== MENU ==================
+
+void printMenu() {
+  Serial.println("\n╔══════════════════════════════════════╗");
+  Serial.println("║  AWS PROVISIONING TOOL v1.0.0        ║");
+  Serial.println("║  ESP32-S3 Municipal Actuator          ║");
+  Serial.println("╠══════════════════════════════════════╣");
+  Serial.print  ("║  Device ID: ");
+  String id = "";
+  prefs.begin("aws_creds", true);
+  id = prefs.getString("device_id", getDeviceID());
+  prefs.end();
+  Serial.print(id);
+  for (int i = id.length(); i < 25; i++) Serial.print(' ');
+  Serial.println("║");
+  Serial.println("╠══════════════════════════════════════╣");
+  Serial.println("║  WRITE_ENDPOINT   — AWS IoT endpoint ║");
+  Serial.println("║  WRITE_CERT       — Device cert PEM  ║");
+  Serial.println("║  WRITE_PKEY       — Private key PEM  ║");
+  Serial.println("║  WRITE_ROOTCA     — Root CA PEM      ║");
+  Serial.println("║  WRITE_JITP_CERT  — JITP claim cert  ║");
+  Serial.println("║  WRITE_JITP_PKEY  — JITP claim key   ║");
+  Serial.println("║  WRITE_DEVICE_ID  — Custom device ID ║");
+  Serial.println("║  READ_ALL         — Show all values  ║");
+  Serial.println("║  VERIFY           — Check required   ║");
+  Serial.println("║  CLEAR_JITP       — Remove JITP only ║");
+  Serial.println("║  CLEAR_ALL        — Erase namespace  ║");
+  Serial.println("║  MENU             — Show this menu   ║");
+  Serial.println("╚══════════════════════════════════════╝");
+  Serial.println("Enter command:");
+}
+
+
+
+
+// ================== SETUP + LOOP ==================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1500);   // USB CDC enumerate on S3
+
+  Serial.println("\n\n");
+  printMenu();
+}
+
+void loop() {
+  if (!Serial.available()) return;
+
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+  cmd.toUpperCase();
+
+  if      (cmd == "WRITE_ENDPOINT")  writeEndpoint();
+  else if (cmd == "WRITE_CERT")      writeCert();
+  else if (cmd == "WRITE_PKEY")      writePkey();
+  else if (cmd == "WRITE_ROOTCA")    writeRootCA();
+  else if (cmd == "WRITE_JITP_CERT") writeJITPCert();
+  else if (cmd == "WRITE_JITP_PKEY") writeJITPPkey();
+  else if (cmd == "WRITE_DEVICE_ID") writeDeviceID();
+  else if (cmd == "READ_ALL")        readAll();
+  else if (cmd == "VERIFY")          verifyCredentials();
+  else if (cmd == "CLEAR_ALL")       clearAll();
+  else if (cmd == "CLEAR_JITP")      clearJITP();
+  else if (cmd == "MENU")            printMenu();
+  else {
+    Serial.print("❌ Unknown command: "); Serial.println(cmd);
+    Serial.println("Type MENU for command list");
+  }
+}
