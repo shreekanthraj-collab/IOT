@@ -1,0 +1,851 @@
+/*
+ * ============================================================
+ *  COMMISSIONING / TEST FIRMWARE  v1.0.0
+ *  ESP32-S3 Linear Actuator Controller
+ * ============================================================
+ *  Run ONCE before flashing production AWS firmware.
+ *  Validates every critical subsystem and prints a PASS/FAIL
+ *  report to the Serial Monitor at 115200 baud.
+ *
+ *  Subsystems tested (in order):
+ *    1.  ESP32-S3 Chip ID + Flash size (16 MB)
+ *    2.  I²C Bus Scan  (AS5600 / INA226 / DS3231)
+ *    3.  DS3231 RTC     – year validity
+ *    4.  INA226         – bus voltage / current
+ *    5.  AS5600         – interactive rotation test
+ *    6.  Relay K1       – audible click confirmation
+ *    7.  Relay K2
+ *    8.  Relay K3
+ *    9.  Buzzer         – audible tone confirmation
+ *   10.  Open Limit Switch
+ *   11.  Close Limit Switch
+ *   12.  RTC Backup Battery  (inferred from DS3231 year)
+ *   13.  A7670C Modem AT     – response within 2 s
+ *   14.  SIM Detection       – AT+CPIN?
+ *   15.  LTE Registration    – AT+CREG? (wait up to 30 s)
+ *   16.  Signal Strength     – AT+CSQ  (CSQ >= 10 required)
+ *   17.  Data Attachment     – AT+CGATT?
+ *   18.  Network Time        – AT+CCLK?
+ *
+ *  Interactive steps (relay, buzzer, limits):
+ *    The firmware prints a prompt and waits up to 5 s for
+ *    y/n confirmation from the serial terminal, then times
+ *    out to FAIL if no response.  AS5600 and limit-switch
+ *    tests are purely GPIO-based (no confirmation needed).
+ *
+ *  To re-run after the initial report, send 'r' on Serial.
+ * ============================================================
+ */
+
+// ─────────────────────────────────────────────────────────────
+//  !!!  CONFIGURE THESE BEFORE FLASHING  !!!
+// ─────────────────────────────────────────────────────────────
+
+// I²C
+#define PIN_I2C_SDA       8
+#define PIN_I2C_SCL       9
+
+// Relays (HIGH = energise coil; set LOW if your board uses
+// active-low relay modules)
+#define PIN_RELAY_K1     10
+#define PIN_RELAY_K2     11
+#define PIN_RELAY_K3     12
+#define RELAY_ON        HIGH
+#define RELAY_OFF        LOW
+
+// Buzzer (HIGH = on; flip if active-low)
+#define PIN_BUZZER       13
+#define BUZZER_ON       HIGH
+#define BUZZER_OFF       LOW
+
+// Limit switches (INPUT_PULLUP assumed → LOW when pressed)
+#define PIN_LIMIT_OPEN   14
+#define PIN_LIMIT_CLOSE  15
+#define LIMIT_ACTIVE     LOW
+
+// A7670C modem  –  HardwareSerial 1
+#define PIN_MODEM_RX     16   // ESP32 RX ← Modem TX
+#define PIN_MODEM_TX     17   // ESP32 TX → Modem RX
+#define PIN_MODEM_PWRKEY 21   // PWRKEY: pull LOW ~1.5 s to power on
+                              // Set to -1 if modem is always powered
+#define MODEM_BAUD    115200
+
+// INA226 shunt  –  match your hardware
+#define R_SHUNT_OHMS   0.1f   // Ω  (typical: 10 mΩ, 50 mΩ, 100 mΩ)
+#define CURRENT_LSB_A  0.001f // A per LSB  (1 mA resolution)
+
+// ─────────────────────────────────────────────────────────────
+//  PASS / FAIL thresholds
+// ─────────────────────────────────────────────────────────────
+#define FLASH_EXPECTED_MB    16
+#define VOLTAGE_MIN_V        5.0f
+#define VOLTAGE_BATT_MIN_V  11.0f
+#define VOLTAGE_BATT_MAX_V  14.6f
+#define CSQ_MIN             10
+#define RTC_YEAR_MIN        2025
+#define MODEM_AT_TIMEOUT_MS 2000
+#define AS5600_DELTA_MIN    10    // raw counts; any less = magnet not moving
+
+// ─────────────────────────────────────────────────────────────
+//  INCLUDES
+// ─────────────────────────────────────────────────────────────
+#include <Arduino.h>
+#include <Wire.h>
+#include "esp_chip_info.h"
+#include "esp_flash.h"
+
+// ─────────────────────────────────────────────────────────────
+//  I²C DEVICE ADDRESSES
+// ─────────────────────────────────────────────────────────────
+#define ADDR_AS5600  0x36
+#define ADDR_INA226  0x40
+#define ADDR_DS3231  0x68
+
+// ─────────────────────────────────────────────────────────────
+//  TEST RESULT TYPE
+// ─────────────────────────────────────────────────────────────
+enum TestResult : uint8_t { PENDING, PASS, FAIL, SKIP };
+
+struct Results {
+  TestResult chip       = PENDING;
+  TestResult flash      = PENDING;
+  TestResult i2c        = PENDING;
+  TestResult ds3231     = PENDING;
+  TestResult ina226     = PENDING;
+  TestResult as5600     = PENDING;
+  TestResult relayK1    = PENDING;
+  TestResult relayK2    = PENDING;
+  TestResult relayK3    = PENDING;
+  TestResult buzzer     = PENDING;
+  TestResult limitOpen  = PENDING;
+  TestResult limitClose = PENDING;
+  TestResult rtcBatt    = PENDING;
+  TestResult modem      = PENDING;
+  TestResult sim        = PENDING;
+  TestResult network    = PENDING;
+  TestResult signal     = PENDING;
+  TestResult cgatt      = PENDING;
+  TestResult cclk       = PENDING;
+} R;
+
+HardwareSerial modemSerial(1);
+
+// ─────────────────────────────────────────────────────────────
+//  UTILITY
+// ─────────────────────────────────────────────────────────────
+
+static const char* resultStr(TestResult r) {
+  switch (r) {
+    case PASS:  return "PASS";
+    case FAIL:  return "FAIL";
+    case SKIP:  return "SKIP";
+    default:    return "----";
+  }
+}
+
+static void separator(char c = '-', int n = 42) {
+  for (int i = 0; i < n; i++) Serial.print(c);
+  Serial.println();
+}
+
+static uint8_t bcd2dec(uint8_t bcd) {
+  return (bcd >> 4) * 10 + (bcd & 0x0F);
+}
+
+// Wait for a single y/n character on Serial; default 'n' on timeout.
+static char promptYN(uint32_t timeoutMs = 5000) {
+  uint32_t start = millis();
+  while (!Serial.available() && (millis() - start < timeoutMs)) delay(50);
+  char c = Serial.available() ? (char)Serial.read() : 'n';
+  while (Serial.available()) Serial.read(); // flush remainder
+  Serial.println(c);
+  return (char)tolower(c);
+}
+
+static bool overallPass(const Results& r) {
+  auto ok = [](TestResult t) { return t == PASS || t == SKIP; };
+  return ok(r.chip) && ok(r.flash) && ok(r.i2c) && ok(r.ds3231) &&
+         ok(r.ina226) && ok(r.as5600) && ok(r.relayK1) && ok(r.relayK2) &&
+         ok(r.relayK3) && ok(r.buzzer) && ok(r.limitOpen) && ok(r.limitClose) &&
+         ok(r.rtcBatt) && ok(r.modem) && ok(r.sim) && ok(r.network) &&
+         ok(r.signal) && ok(r.cgatt) && ok(r.cclk);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  I²C REGISTER HELPERS
+// ─────────────────────────────────────────────────────────────
+
+static bool i2cPing(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission() == 0;
+}
+
+static uint16_t i2cRead16(uint8_t addr, uint8_t reg) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom(addr, (uint8_t)2);
+  if (Wire.available() < 2) return 0xFFFF;
+  uint8_t hi = Wire.read();
+  uint8_t lo = Wire.read();
+  return ((uint16_t)hi << 8) | lo;
+}
+
+static int16_t i2cRead16s(uint8_t addr, uint8_t reg) {
+  return (int16_t)i2cRead16(addr, reg);
+}
+
+static bool i2cWrite16(uint8_t addr, uint8_t reg, uint16_t val) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.write((val >> 8) & 0xFF);
+  Wire.write(val & 0xFF);
+  return Wire.endTransmission() == 0;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  MODEM AT HELPER
+// ─────────────────────────────────────────────────────────────
+
+static String sendAT(const char* cmd, uint32_t timeoutMs = 3000) {
+  while (modemSerial.available()) modemSerial.read(); // flush Rx
+  modemSerial.println(cmd);
+  uint32_t start = millis();
+  String resp = "";
+  while (millis() - start < timeoutMs) {
+    while (modemSerial.available()) resp += (char)modemSerial.read();
+    if (resp.indexOf("OK")    >= 0 ||
+        resp.indexOf("ERROR") >= 0 ||
+        resp.indexOf("+CME")  >= 0 ||
+        resp.indexOf("READY") >= 0) break;
+    delay(10);
+  }
+  resp.trim();
+  return resp;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TEST 1: ESP32-S3 CHIP + FLASH SIZE
+// ─────────────────────────────────────────────────────────────
+
+static void testChipAndFlash() {
+  separator('=');
+  Serial.println("TEST 1/2: ESP32-S3 Chip + Flash");
+  separator();
+
+  // Chip model
+  esp_chip_info_t info;
+  esp_chip_info(&info);
+  bool isS3 = (info.model == CHIP_ESP32S3);
+  Serial.printf("  Model      : %s\n", isS3 ? "ESP32-S3" : "?? (expected ESP32-S3)");
+  Serial.printf("  Cores      : %d\n", info.cores);
+  R.chip = isS3 ? PASS : FAIL;
+  Serial.printf("  Chip       : %s\n", resultStr(R.chip));
+
+  // Flash size
+  uint32_t flashBytes = 0;
+  esp_flash_get_size(NULL, &flashBytes);
+  uint32_t flashMB = flashBytes / (1024 * 1024);
+  Serial.printf("  Flash Size : %u MB\n", flashMB);
+  R.flash = (flashMB == (uint32_t)FLASH_EXPECTED_MB) ? PASS : FAIL;
+  Serial.printf("  Flash      : %s  (expected %d MB)\n",
+                resultStr(R.flash), FLASH_EXPECTED_MB);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TEST 2: I²C BUS SCAN
+// ─────────────────────────────────────────────────────────────
+
+static void testI2CScan() {
+  separator('=');
+  Serial.println("TEST 3: I²C Bus Scan");
+  separator();
+
+  bool foundAS5600 = false, foundINA226 = false, foundDS3231 = false;
+
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      const char* tag = "";
+      if (addr == ADDR_AS5600) { tag = "  ← AS5600";  foundAS5600 = true; }
+      if (addr == ADDR_INA226) { tag = "  ← INA226";  foundINA226 = true; }
+      if (addr == ADDR_DS3231) { tag = "  ← DS3231";  foundDS3231 = true; }
+      Serial.printf("  0x%02X%s\n", addr, tag);
+    }
+  }
+
+  Serial.println();
+  Serial.printf("  AS5600 0x36 : %s\n", foundAS5600 ? "FOUND" : "MISSING");
+  Serial.printf("  INA226 0x40 : %s\n", foundINA226 ? "FOUND" : "MISSING");
+  Serial.printf("  DS3231 0x68 : %s\n", foundDS3231 ? "FOUND" : "MISSING");
+
+  R.i2c = (foundAS5600 && foundINA226 && foundDS3231) ? PASS : FAIL;
+  Serial.printf("  I2C Scan    : %s\n", resultStr(R.i2c));
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TEST 3: DS3231 RTC  +  RTC BACKUP BATTERY  (inferred)
+// ─────────────────────────────────────────────────────────────
+
+static void testDS3231() {
+  separator('=');
+  Serial.println("TEST 4: DS3231 RTC (+ Backup Battery)");
+  separator();
+
+  // Point to register 0x00 (seconds)
+  Wire.beginTransmission(ADDR_DS3231);
+  Wire.write(0x00);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("  ERROR: DS3231 not responding");
+    R.ds3231 = R.rtcBatt = FAIL;
+    return;
+  }
+
+  Wire.requestFrom(ADDR_DS3231, (uint8_t)7);
+  if (Wire.available() < 7) {
+    Serial.println("  ERROR: Incomplete read from DS3231");
+    R.ds3231 = R.rtcBatt = FAIL;
+    return;
+  }
+
+  uint8_t sec   = bcd2dec(Wire.read() & 0x7F);
+  uint8_t mn    = bcd2dec(Wire.read() & 0x7F);
+  uint8_t hr    = bcd2dec(Wire.read() & 0x3F);
+  /* dow */       Wire.read();
+  uint8_t day   = bcd2dec(Wire.read());
+  uint8_t mo    = bcd2dec(Wire.read() & 0x1F);
+  uint8_t yr    = bcd2dec(Wire.read());         // 0–99
+  uint16_t fullYear = 2000 + yr;
+
+  Serial.printf("  RTC Time : %04u-%02u-%02u %02u:%02u:%02u\n",
+                fullYear, mo, day, hr, mn, sec);
+
+  if (fullYear >= RTC_YEAR_MIN) {
+    R.ds3231  = PASS;
+    R.rtcBatt = PASS;
+    Serial.printf("  DS3231   : PASS\n");
+    Serial.printf("  RTC Batt : PASS  (year valid → battery maintained time)\n");
+  } else {
+    R.ds3231  = FAIL;
+    R.rtcBatt = FAIL;
+    Serial.printf("  DS3231   : FAIL  (year=%u < %u — set RTC or replace battery)\n",
+                  fullYear, RTC_YEAR_MIN);
+    Serial.printf("  RTC Batt : FAIL\n");
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TEST 4: INA226  –  voltage + current
+// ─────────────────────────────────────────────────────────────
+//
+//  INA226 register map:
+//    0x00  Configuration
+//    0x02  Bus Voltage   (1.25 mV / LSB, signed 16-bit)
+//    0x04  Current       (CURRENT_LSB_A / LSB, signed 16-bit)
+//    0x05  Calibration   = 0.00512 / (CURRENT_LSB_A × R_SHUNT)
+//
+//  Config 0x4527:
+//    Bits 15-13: AVG = 011 → 64 samples
+//    Bits 12-10: VBUS_CT = 001 → 1.1 ms
+//    Bits  9-7:  VSH_CT  = 001 → 1.1 ms
+//    Bits  6-4:  reserved
+//    Bits  2-0:  MODE    = 111 → shunt + bus, continuous
+// ─────────────────────────────────────────────────────────────
+
+static void testINA226() {
+  separator('=');
+  Serial.println("TEST 5: INA226 Voltage / Current");
+  separator();
+
+  if (!i2cPing(ADDR_INA226)) {
+    Serial.println("  ERROR: INA226 not responding");
+    R.ina226 = FAIL;
+    return;
+  }
+
+  // Configuration register
+  if (!i2cWrite16(ADDR_INA226, 0x00, 0x4527)) {
+    Serial.println("  ERROR: INA226 config write failed");
+    R.ina226 = FAIL;
+    return;
+  }
+
+  // Calibration register
+  uint16_t cal = (uint16_t)(0.00512f / (CURRENT_LSB_A * R_SHUNT_OHMS));
+  i2cWrite16(ADDR_INA226, 0x05, cal);
+  Serial.printf("  Cal register : %u  (R_shunt=%.3fΩ, LSB=%.1f mA)\n",
+                cal, R_SHUNT_OHMS, CURRENT_LSB_A * 1000.0f);
+
+  delay(200); // wait for first conversion
+
+  // Bus voltage: 1.25 mV per LSB
+  int16_t busRaw = i2cRead16s(ADDR_INA226, 0x02);
+  float busV = busRaw * 0.00125f;
+
+  // Current
+  int16_t curRaw = i2cRead16s(ADDR_INA226, 0x04);
+  float curA = curRaw * CURRENT_LSB_A;
+
+  Serial.printf("  Bus Voltage  : %.3f V\n", busV);
+  Serial.printf("  Current      : %.3f A\n", curA);
+
+  if (busV > VOLTAGE_MIN_V) {
+    R.ina226 = PASS;
+    if (busV >= VOLTAGE_BATT_MIN_V && busV <= VOLTAGE_BATT_MAX_V)
+      Serial.printf("  INA226       : PASS  (%.2f V – within 4S range %.1f–%.1f V)\n",
+                    busV, VOLTAGE_BATT_MIN_V, VOLTAGE_BATT_MAX_V);
+    else
+      Serial.printf("  INA226       : PASS  (%.2f V – outside 4S range, check charger)\n",
+                    busV);
+  } else {
+    R.ina226 = FAIL;
+    Serial.printf("  INA226       : FAIL  (%.2f V < %.1f V minimum)\n",
+                  busV, VOLTAGE_MIN_V);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TEST 5: AS5600  –  static read + interactive rotation
+// ─────────────────────────────────────────────────────────────
+//
+//  AS5600 registers 0x0E/0x0F → 12-bit filtered output angle
+//  0x0C/0x0D → raw angle (before filtering)
+// ─────────────────────────────────────────────────────────────
+
+static uint16_t as5600Read() {
+  return i2cRead16(ADDR_AS5600, 0x0E) & 0x0FFF;
+}
+
+static void testAS5600() {
+  separator('=');
+  Serial.println("TEST 6: AS5600 Magnetic Encoder");
+  separator();
+
+  if (!i2cPing(ADDR_AS5600)) {
+    Serial.println("  ERROR: AS5600 not responding");
+    R.as5600 = FAIL;
+    return;
+  }
+
+  uint16_t initial = as5600Read();
+  Serial.printf("  Initial Angle : %u\n", initial);
+
+  Serial.println();
+  Serial.println("  >>> Rotate valve shaft now (5 s)...");
+  Serial.println("  (watching for magnet movement)");
+  Serial.println();
+
+  uint16_t minA = initial, maxA = initial;
+  uint32_t start   = millis();
+  uint32_t lastPrt = 0;
+
+  while (millis() - start < 5000) {
+    uint16_t a = as5600Read();
+    if (a < minA) minA = a;
+    if (a > maxA) maxA = a;
+    if (millis() - lastPrt >= 250) {
+      Serial.printf("  Angle: %4u\n", a);
+      lastPrt = millis();
+    }
+    delay(50);
+  }
+
+  // Handle 0/4095 wrap
+  uint16_t delta = maxA - minA;
+  if (delta > 2048) delta = 4096 - delta;
+
+  Serial.println();
+  Serial.printf("  Min: %u  Max: %u  Delta: %u counts\n", minA, maxA, delta);
+
+  if (delta >= AS5600_DELTA_MIN) {
+    R.as5600 = PASS;
+    Serial.println("  AS5600 : PASS  (angle changed – magnet OK)");
+  } else {
+    R.as5600 = FAIL;
+    Serial.println("  AS5600 : FAIL  (no movement detected – check magnet, gap, and wiring)");
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TEST 6–8: RELAY  K1 / K2 / K3
+// ─────────────────────────────────────────────────────────────
+
+static TestResult testRelay(int pin, const char* label) {
+  separator('=');
+  Serial.printf("TEST: Relay %s (GPIO %d)\n", label, pin);
+  separator();
+
+  Serial.printf("  %s ON\n", label);
+  digitalWrite(pin, RELAY_ON);
+  delay(400);
+  Serial.println("  --- listen for CLICK ---");
+  delay(400);
+  Serial.printf("  %s OFF\n", label);
+  digitalWrite(pin, RELAY_OFF);
+  delay(300);
+
+  Serial.printf("  Did relay %s click? [y/n] > ", label);
+  char c = promptYN(5000);
+
+  TestResult res = (c == 'y') ? PASS : FAIL;
+  Serial.printf("  %s : %s\n", label, resultStr(res));
+  return res;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TEST 9: BUZZER
+// ─────────────────────────────────────────────────────────────
+
+static void testBuzzer() {
+  separator('=');
+  Serial.println("TEST: Buzzer");
+  separator();
+
+  Serial.println("  Buzzer ON (1 s)...");
+  digitalWrite(PIN_BUZZER, BUZZER_ON);
+  delay(1000);
+  digitalWrite(PIN_BUZZER, BUZZER_OFF);
+  delay(200);
+
+  Serial.print("  Did you hear the buzzer? [y/n] > ");
+  char c = promptYN(5000);
+
+  R.buzzer = (c == 'y') ? PASS : FAIL;
+  Serial.printf("  Buzzer : %s\n", resultStr(R.buzzer));
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TEST 10/11: LIMIT SWITCHES
+// ─────────────────────────────────────────────────────────────
+
+static TestResult testLimitSwitch(int pin, const char* label) {
+  separator('=');
+  Serial.printf("TEST: %s Limit Switch (GPIO %d)\n", label, pin);
+  separator();
+
+  Serial.printf("  >>> Press the %s limit switch now (5 s)...\n", label);
+
+  bool triggered = false;
+  uint32_t start = millis();
+  while (millis() - start < 5000) {
+    if (digitalRead(pin) == LIMIT_ACTIVE) {
+      triggered = true;
+      Serial.printf("  %s Limit : TRIGGERED\n", label);
+      delay(200); // debounce
+      break;
+    }
+    delay(50);
+  }
+
+  if (!triggered) Serial.printf("  %s Limit : TIMEOUT (not pressed)\n", label);
+  TestResult res = triggered ? PASS : FAIL;
+  Serial.printf("  %s : %s\n", label, resultStr(res));
+  return res;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TEST 12: A7670C MODEM  –  AT response
+// ─────────────────────────────────────────────────────────────
+
+static void testModem() {
+  separator('=');
+  Serial.println("TEST: A7670C Modem (AT)");
+  separator();
+
+  String resp = sendAT("AT", MODEM_AT_TIMEOUT_MS);
+  Serial.printf("  >> AT\n  << %s\n", resp.c_str());
+
+  R.modem = (resp.indexOf("OK") >= 0) ? PASS : FAIL;
+  Serial.printf("  Modem : %s\n", resultStr(R.modem));
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TEST 13: SIM DETECTION
+// ─────────────────────────────────────────────────────────────
+
+static void testSIM() {
+  separator('=');
+  Serial.println("TEST: SIM Detection (AT+CPIN?)");
+  separator();
+
+  String resp = sendAT("AT+CPIN?", 5000);
+  Serial.printf("  >> AT+CPIN?\n  << %s\n", resp.c_str());
+
+  if (resp.indexOf("READY") >= 0) {
+    R.sim = PASS;
+    Serial.println("  SIM : PASS  (CPIN READY)");
+  } else if (resp.indexOf("NOT INSERTED") >= 0) {
+    R.sim = FAIL;
+    Serial.println("  SIM : FAIL  (not inserted)");
+  } else {
+    R.sim = FAIL;
+    Serial.println("  SIM : FAIL  (unexpected response)");
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TEST 14: LTE REGISTRATION  (AT+CREG?, wait up to 30 s)
+// ─────────────────────────────────────────────────────────────
+
+static void testLTE() {
+  separator('=');
+  Serial.println("TEST: LTE Registration (AT+CREG?)");
+  separator();
+  Serial.println("  Waiting for registration (up to 30 s)...");
+
+  R.network = FAIL;
+  for (int i = 0; i < 30; i++) {
+    String resp = sendAT("AT+CREG?", 2000);
+    Serial.printf("  [%2d] %s\n", i + 1, resp.c_str());
+    // Stat 1 = registered home, 5 = registered roaming
+    if (resp.indexOf(",1")  >= 0 || resp.indexOf(",5")  >= 0 ||
+        resp.indexOf(": 1") >= 0 || resp.indexOf(": 5") >= 0) {
+      R.network = PASS;
+      break;
+    }
+    delay(1000);
+  }
+  Serial.printf("  Network : %s\n", resultStr(R.network));
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TEST 15: SIGNAL STRENGTH  (AT+CSQ)
+// ─────────────────────────────────────────────────────────────
+
+static void testSignal() {
+  separator('=');
+  Serial.println("TEST: Signal Strength (AT+CSQ)");
+  separator();
+
+  String resp = sendAT("AT+CSQ");
+  Serial.printf("  >> AT+CSQ\n  << %s\n", resp.c_str());
+
+  int csq = -1;
+  int idx = resp.indexOf("+CSQ:");
+  if (idx >= 0) csq = resp.substring(idx + 5).toInt();
+
+  const char* quality =
+    (csq >=  0 && csq <=  9) ? "Poor"      :
+    (csq >= 10 && csq <= 14) ? "Fair"      :
+    (csq >= 15 && csq <= 20) ? "Good"      :
+    (csq >= 21 && csq <= 31) ? "Excellent" : "Unknown";
+
+  Serial.printf("  CSQ = %d  (%s)\n", csq, quality);
+
+  //  CSQ 99 = not detectable
+  R.signal = (csq >= CSQ_MIN && csq < 99) ? PASS : FAIL;
+  Serial.printf("  Signal : %s  (minimum %d required for deployment)\n",
+                resultStr(R.signal), CSQ_MIN);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TEST 16: DATA ATTACHMENT  (AT+CGATT?)
+// ─────────────────────────────────────────────────────────────
+
+static void testCGATT() {
+  separator('=');
+  Serial.println("TEST: Data Attachment (AT+CGATT?)");
+  separator();
+
+  String resp = sendAT("AT+CGATT?");
+  Serial.printf("  >> AT+CGATT?\n  << %s\n", resp.c_str());
+
+  R.cgatt = (resp.indexOf("+CGATT: 1") >= 0) ? PASS : FAIL;
+  Serial.printf("  CGATT : %s\n", resultStr(R.cgatt));
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TEST 17: NETWORK TIME  (AT+CCLK?)
+// ─────────────────────────────────────────────────────────────
+
+static void testCCLK() {
+  separator('=');
+  Serial.println("TEST: Network Time (AT+CCLK?)");
+  separator();
+
+  String resp = sendAT("AT+CCLK?");
+  Serial.printf("  >> AT+CCLK?\n  << %s\n", resp.c_str());
+
+  R.cclk = (resp.indexOf("+CCLK:") >= 0 && resp.indexOf("OK") >= 0) ? PASS : FAIL;
+  Serial.printf("  CCLK : %s\n", resultStr(R.cclk));
+}
+
+// ─────────────────────────────────────────────────────────────
+//  COMMISSIONING REPORT
+// ─────────────────────────────────────────────────────────────
+
+static void printReport() {
+  Serial.println();
+  separator('=', 42);
+  Serial.println("  COMMISSIONING REPORT  v1.0.0");
+  separator('=', 42);
+
+  Serial.printf("  %-22s %s\n", "ESP32-S3",     resultStr(R.chip));
+  Serial.printf("  %-22s %s\n", "FLASH 16 MB",  resultStr(R.flash));
+  Serial.println();
+  Serial.printf("  %-22s %s\n", "I2C SCAN",     resultStr(R.i2c));
+  Serial.printf("  %-22s %s\n", "DS3231 RTC",   resultStr(R.ds3231));
+  Serial.printf("  %-22s %s\n", "INA226",       resultStr(R.ina226));
+  Serial.printf("  %-22s %s\n", "AS5600",       resultStr(R.as5600));
+  Serial.println();
+  Serial.printf("  %-22s %s\n", "RELAY K1",     resultStr(R.relayK1));
+  Serial.printf("  %-22s %s\n", "RELAY K2",     resultStr(R.relayK2));
+  Serial.printf("  %-22s %s\n", "RELAY K3",     resultStr(R.relayK3));
+  Serial.println();
+  Serial.printf("  %-22s %s\n", "BUZZER",       resultStr(R.buzzer));
+  Serial.printf("  %-22s %s\n", "LIMIT OPEN",   resultStr(R.limitOpen));
+  Serial.printf("  %-22s %s\n", "LIMIT CLOSE",  resultStr(R.limitClose));
+  Serial.printf("  %-22s %s\n", "RTC BATTERY",  resultStr(R.rtcBatt));
+  Serial.println();
+  Serial.printf("  %-22s %s\n", "A7670C MODEM", resultStr(R.modem));
+  Serial.printf("  %-22s %s\n", "SIM",          resultStr(R.sim));
+  Serial.printf("  %-22s %s\n", "LTE NETWORK",  resultStr(R.network));
+  Serial.printf("  %-22s %s\n", "SIGNAL (CSQ)", resultStr(R.signal));
+  Serial.printf("  %-22s %s\n", "DATA (CGATT)", resultStr(R.cgatt));
+  Serial.printf("  %-22s %s\n", "NETWORK TIME", resultStr(R.cclk));
+
+  separator('-', 42);
+
+  bool pass = overallPass(R);
+  Serial.printf("  %-22s %s\n", "OVERALL", pass ? "PASS" : "FAIL");
+  separator('=', 42);
+
+  if (pass) {
+    Serial.println();
+    Serial.println("  >> READY FOR PRODUCTION FIRMWARE <<");
+  } else {
+    Serial.println();
+    Serial.println("  >> UNIT REQUIRES ATTENTION <<");
+    Serial.println();
+    // List every failing item
+    auto chk = [](const char* name, TestResult t) {
+      if (t == FAIL) Serial.printf("  [!] CHECK %s\n", name);
+    };
+    chk("ESP32-S3",     R.chip);
+    chk("FLASH 16 MB",  R.flash);
+    chk("I2C SCAN",     R.i2c);
+    chk("DS3231 RTC",   R.ds3231);
+    chk("INA226",       R.ina226);
+    chk("AS5600",       R.as5600);
+    chk("RELAY K1",     R.relayK1);
+    chk("RELAY K2",     R.relayK2);
+    chk("RELAY K3",     R.relayK3);
+    chk("BUZZER",       R.buzzer);
+    chk("LIMIT OPEN",   R.limitOpen);
+    chk("LIMIT CLOSE",  R.limitClose);
+    chk("RTC BATTERY",  R.rtcBatt);
+    chk("A7670C MODEM", R.modem);
+    chk("SIM",          R.sim);
+    chk("LTE NETWORK",  R.network);
+    chk("SIGNAL",       R.signal);
+    chk("DATA (CGATT)", R.cgatt);
+    chk("NETWORK TIME", R.cclk);
+  }
+
+  separator('=', 42);
+  Serial.println();
+  Serial.println("  Send 'r' + Enter to re-run all tests.");
+  Serial.println();
+}
+
+// ─────────────────────────────────────────────────────────────
+//  FULL TEST SEQUENCE
+// ─────────────────────────────────────────────────────────────
+
+static void runAllTests() {
+  R = Results(); // reset all to PENDING
+
+  Serial.println();
+  separator('=', 42);
+  Serial.println("  COMMISSIONING FIRMWARE  v1.0.0");
+  Serial.println("  ESP32-S3 Linear Actuator Controller");
+  separator('=', 42);
+  Serial.println();
+  Serial.println("  Keep Serial Monitor open at 115200 baud.");
+  Serial.println("  Respond to prompts with y/n + Enter.");
+  Serial.println("  AS5600 and limit-switch tests are automatic.");
+  Serial.println();
+
+  // ── Hardware tests (automatic) ───────────────────────────
+  testChipAndFlash();
+  testI2CScan();
+  testDS3231();   // sets rtcBatt as a side-effect
+  testINA226();
+  testAS5600();
+
+  // ── Interactive hardware tests ───────────────────────────
+  R.relayK1    = testRelay(PIN_RELAY_K1, "K1");
+  R.relayK2    = testRelay(PIN_RELAY_K2, "K2");
+  R.relayK3    = testRelay(PIN_RELAY_K3, "K3");
+  testBuzzer();
+  R.limitOpen  = testLimitSwitch(PIN_LIMIT_OPEN,  "OPEN");
+  R.limitClose = testLimitSwitch(PIN_LIMIT_CLOSE, "CLOSE");
+
+  // ── Modem tests (skip sub-tests if modem unresponsive) ───
+  testModem();
+  if (R.modem == PASS) {
+    testSIM();
+    testLTE();
+    testSignal();
+    testCGATT();
+    testCCLK();
+  } else {
+    Serial.println();
+    Serial.println("  Modem unresponsive – skipping SIM / LTE tests.");
+    R.sim = R.network = R.signal = R.cgatt = R.cclk = SKIP;
+  }
+
+  printReport();
+}
+
+// ─────────────────────────────────────────────────────────────
+//  SETUP
+// ─────────────────────────────────────────────────────────────
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000); // wait for Serial to settle after reset
+
+  // I²C
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  Wire.setClock(100000); // 100 kHz – safe for all three devices
+
+  // GPIO outputs
+  pinMode(PIN_RELAY_K1, OUTPUT); digitalWrite(PIN_RELAY_K1, RELAY_OFF);
+  pinMode(PIN_RELAY_K2, OUTPUT); digitalWrite(PIN_RELAY_K2, RELAY_OFF);
+  pinMode(PIN_RELAY_K3, OUTPUT); digitalWrite(PIN_RELAY_K3, RELAY_OFF);
+  pinMode(PIN_BUZZER,   OUTPUT); digitalWrite(PIN_BUZZER,   BUZZER_OFF);
+
+  // GPIO inputs
+  pinMode(PIN_LIMIT_OPEN,  INPUT_PULLUP);
+  pinMode(PIN_LIMIT_CLOSE, INPUT_PULLUP);
+
+  // Modem serial
+  modemSerial.begin(MODEM_BAUD, SERIAL_8N1, PIN_MODEM_RX, PIN_MODEM_TX);
+
+  // Power on modem via PWRKEY if pin is defined
+  if (PIN_MODEM_PWRKEY >= 0) {
+    pinMode(PIN_MODEM_PWRKEY, OUTPUT);
+    digitalWrite(PIN_MODEM_PWRKEY, HIGH);   // ensure defined state
+    delay(200);
+    digitalWrite(PIN_MODEM_PWRKEY, LOW);    // pull low to trigger power-on
+    delay(1500);                            // A7670C: hold ~1.5 s
+    digitalWrite(PIN_MODEM_PWRKEY, HIGH);   // release
+    delay(5000);                            // wait for modem boot
+    Serial.println("  Modem power-on sequence complete.");
+  }
+
+  runAllTests();
+}
+
+// ─────────────────────────────────────────────────────────────
+//  LOOP  –  re-run on 'r'
+// ─────────────────────────────────────────────────────────────
+
+void loop() {
+  if (Serial.available()) {
+    char c = (char)Serial.read();
+    while (Serial.available()) Serial.read(); // flush rest of line
+    if (c == 'r' || c == 'R') runAllTests();
+  }
+}
