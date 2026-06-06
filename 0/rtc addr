@@ -1,0 +1,334 @@
+/*
+ * ============================================================
+ *  I²C STANDALONE TEST  v1.0.1
+ *  ESP32-S3 Linear Actuator Controller
+ * ============================================================
+ *  Tests AS5600, INA226, PCF8563 RTC.
+ *  Send 'r' + Enter to re-run.
+ *
+ *  CHANGELOG v1.0.1
+ *    - RTC changed from DS3231 (0x68) to PCF8563 (0x51)
+ *    - PCF8563 time registers start at 0x02 (not 0x00)
+ *    - VL bit (bit7 of seconds reg) checked for battery loss
+ *    - DS3231 temperature read removed (PCF8563 has no temp sensor)
+ * ============================================================
+ */
+
+#define PIN_I2C_SDA   8
+#define PIN_I2C_SCL   9
+
+#define ADDR_AS5600   0x36
+#define ADDR_INA226   0x40
+#define ADDR_PCF8563  0x51   // PCF8563 RTC (not DS3231 0x68)
+
+#include <Arduino.h>
+#include <Wire.h>
+
+// ─────────────────────────────────────────────────────────────
+//  HELPERS
+// ─────────────────────────────────────────────────────────────
+
+static void separator(char c = '-', int n = 42) {
+  for (int i = 0; i < n; i++) Serial.print(c);
+  Serial.println();
+}
+
+static bool i2cPing(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission() == 0;
+}
+
+static uint16_t i2cRead16(uint8_t addr, uint8_t reg) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom(addr, (uint8_t)2);
+  if (Wire.available() < 2) return 0xFFFF;
+  uint8_t hi = Wire.read();
+  uint8_t lo = Wire.read();
+  return ((uint16_t)hi << 8) | lo;
+}
+
+static uint8_t bcd2dec(uint8_t bcd) {
+  return (bcd >> 4) * 10 + (bcd & 0x0F);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TEST A: BUS SCAN
+// ─────────────────────────────────────────────────────────────
+
+static bool testBusScan() {
+  separator('=');
+  Serial.println("TEST A: I2C Bus Scan");
+  separator();
+
+  bool foundAS5600  = false;
+  bool foundINA226  = false;
+  bool foundPCF8563 = false;
+
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      const char* tag = "";
+      if (addr == ADDR_AS5600)  { tag = "  <- AS5600";   foundAS5600  = true; }
+      if (addr == ADDR_INA226)  { tag = "  <- INA226";   foundINA226  = true; }
+      if (addr == ADDR_PCF8563) { tag = "  <- PCF8563";  foundPCF8563 = true; }
+      Serial.printf("  0x%02X%s\n", addr, tag);
+    }
+  }
+
+  Serial.println();
+  Serial.printf("  AS5600  0x36 : %s\n", foundAS5600  ? "FOUND" : "MISSING");
+  Serial.printf("  INA226  0x40 : %s\n", foundINA226  ? "FOUND" : "MISSING");
+  Serial.printf("  PCF8563 0x51 : %s\n", foundPCF8563 ? "FOUND" : "MISSING");
+
+  bool pass = foundAS5600 && foundINA226 && foundPCF8563;
+  Serial.printf("  Bus Scan     : %s\n", pass ? "PASS" : "FAIL");
+  return pass;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TEST B: AS5600
+// ─────────────────────────────────────────────────────────────
+
+static void testAS5600() {
+  separator('=');
+  Serial.println("TEST B: AS5600 Magnetic Encoder");
+  separator();
+
+  if (!i2cPing(ADDR_AS5600)) {
+    Serial.println("  ERROR: AS5600 not responding  -> FAIL");
+    return;
+  }
+
+  // AGC register 0x1A: magnet detection bits
+  //   Bit 5 (MH) = 1 → too strong
+  //   Bit 4 (ML) = 1 → too weak
+  //   Bit 3 (MD) = 1 → magnet detected (OK)
+  Wire.beginTransmission(ADDR_AS5600);
+  Wire.write(0x1A);
+  Wire.endTransmission(false);
+  Wire.requestFrom(ADDR_AS5600, (uint8_t)1);
+  uint8_t agc = Wire.available() ? Wire.read() : 0xFF;
+
+  bool magnetDetect = (agc & 0x08) != 0;
+  bool tooStrong    = (agc & 0x20) != 0;
+  bool tooWeak      = (agc & 0x10) != 0;
+
+  Serial.printf("  AGC reg 0x1A : 0x%02X\n", agc);
+  Serial.printf("  MD (magnet)  : %s\n", magnetDetect ? "detected"                 : "NOT detected");
+  Serial.printf("  MH (too str) : %s\n", tooStrong    ? "YES (move magnet further)" : "no");
+  Serial.printf("  ML (too weak): %s\n", tooWeak      ? "YES (move magnet closer)"  : "no");
+
+  // Raw angle (0x0C) and filtered angle (0x0E)
+  uint16_t rawAngle  = i2cRead16(ADDR_AS5600, 0x0C) & 0x0FFF;
+  uint16_t filtAngle = i2cRead16(ADDR_AS5600, 0x0E) & 0x0FFF;
+  float    degrees   = filtAngle * 360.0f / 4096.0f;
+
+  Serial.printf("  Raw Angle    : %u counts\n",         rawAngle);
+  Serial.printf("  Filt Angle   : %u counts (%.1f deg)\n", filtAngle, degrees);
+
+  bool pass = magnetDetect && !tooStrong && !tooWeak;
+  Serial.printf("  AS5600       : %s\n", pass ? "PASS" : "FAIL");
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TEST C: INA226
+// ─────────────────────────────────────────────────────────────
+
+static void testINA226() {
+  separator('=');
+  Serial.println("TEST C: INA226 Power Monitor");
+  separator();
+
+  if (!i2cPing(ADDR_INA226)) {
+    Serial.println("  ERROR: INA226 not responding  -> FAIL");
+    return;
+  }
+
+  // Manufacturer ID 0xFE → TI = 0x5449
+  uint16_t mfr = i2cRead16(ADDR_INA226, 0xFE);
+  Serial.printf("  Manufacturer ID : 0x%04X  %s\n",
+                mfr, (mfr == 0x5449) ? "(TI - correct)" : "(unexpected)");
+
+  // Die ID 0xFF → INA226 = 0x2260
+  uint16_t die = i2cRead16(ADDR_INA226, 0xFF);
+  Serial.printf("  Die ID          : 0x%04X  %s\n",
+                die, (die == 0x2260) ? "(INA226 - correct)" : "(unexpected)");
+
+  // Config: 64-sample avg, 1.1 ms conv, continuous shunt+bus  (0x4527)
+  Wire.beginTransmission(ADDR_INA226);
+  Wire.write(0x00);
+  Wire.write(0x45); Wire.write(0x27);
+  bool cfgOK = (Wire.endTransmission() == 0);
+  Serial.printf("  Config write    : %s\n", cfgOK ? "OK" : "FAILED");
+
+  // Calibration: 0.00512 / (0.001 A/LSB × 0.1 Ω) = 512 = 0x0200
+  Wire.beginTransmission(ADDR_INA226);
+  Wire.write(0x05);
+  Wire.write(0x02); Wire.write(0x00);
+  bool calOK = (Wire.endTransmission() == 0);
+  Serial.printf("  Cal write       : %s\n", calOK ? "OK" : "FAILED");
+
+  delay(200); // wait for first conversion
+
+  // Bus voltage  reg 0x02 — 1.25 mV/LSB
+  int16_t busRaw  = (int16_t)i2cRead16(ADDR_INA226, 0x02);
+  float   busV    = busRaw * 0.00125f;
+
+  // Shunt voltage  reg 0x01 — 2.5 µV/LSB
+  int16_t shuntRaw = (int16_t)i2cRead16(ADDR_INA226, 0x01);
+  float   shuntMV  = shuntRaw * 0.0025f;
+
+  // Current  reg 0x04 — 1 mA/LSB
+  int16_t curRaw = (int16_t)i2cRead16(ADDR_INA226, 0x04);
+  float   curA   = curRaw * 0.001f;
+
+  Serial.printf("  Bus Voltage     : %.3f V\n",  busV);
+  Serial.printf("  Shunt Voltage   : %.3f mV\n", shuntMV);
+  Serial.printf("  Current         : %.3f A\n",  curA);
+
+  bool pass = (mfr == 0x5449) && cfgOK && calOK && (busV > 1.0f);
+  Serial.printf("  INA226          : %s\n", pass ? "PASS" : "FAIL");
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TEST D: PCF8563 RTC
+// ─────────────────────────────────────────────────────────────
+//
+//  PCF8563 register map (time block starts at 0x02):
+//    0x02  VL_seconds  bit7=VL (voltage low flag), bits6:0 = seconds BCD
+//    0x03  Minutes     bits6:0 BCD
+//    0x04  Hours       bits5:0 BCD
+//    0x05  Days        bits5:0 BCD
+//    0x06  Weekdays    bits2:0
+//    0x07  Months      bit7=century, bits4:0 BCD
+//    0x08  Years       bits7:0 BCD (00–99, base 2000)
+//
+//  VL = 1 → power failure detected, time is unreliable → battery dead/missing
+//  No temperature sensor (unlike DS3231)
+// ─────────────────────────────────────────────────────────────
+
+static void testPCF8563() {
+  separator('=');
+  Serial.println("TEST D: PCF8563 RTC");
+  separator();
+
+  if (!i2cPing(ADDR_PCF8563)) {
+    Serial.println("  ERROR: PCF8563 not responding  -> FAIL");
+    return;
+  }
+
+  // Point to register 0x02 (VL_seconds)
+  Wire.beginTransmission(ADDR_PCF8563);
+  Wire.write(0x02);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("  ERROR: PCF8563 write failed  -> FAIL");
+    return;
+  }
+
+  // Read 7 bytes: sec, min, hr, day, weekday, month, year
+  Wire.requestFrom(ADDR_PCF8563, (uint8_t)7);
+  if (Wire.available() < 7) {
+    Serial.println("  ERROR: PCF8563 incomplete read  -> FAIL");
+    return;
+  }
+
+  uint8_t rawSec  = Wire.read();
+  uint8_t rawMin  = Wire.read();
+  uint8_t rawHr   = Wire.read();
+  uint8_t rawDay  = Wire.read();
+  /* weekday */     Wire.read();
+  uint8_t rawMon  = Wire.read();
+  uint8_t rawYr   = Wire.read();
+
+  // VL bit — bit 7 of seconds register
+  // If set: clock voltage dropped, time data is unreliable
+  bool vlFlag = (rawSec & 0x80) != 0;
+
+  // Decode BCD fields (mask off status bits first)
+  uint8_t  sec      = bcd2dec(rawSec  & 0x7F);
+  uint8_t  mn       = bcd2dec(rawMin  & 0x7F);
+  uint8_t  hr       = bcd2dec(rawHr   & 0x3F);
+  uint8_t  day      = bcd2dec(rawDay  & 0x3F);
+  uint8_t  month    = bcd2dec(rawMon  & 0x1F);
+  uint8_t  yr       = bcd2dec(rawYr);
+  uint16_t fullYear = 2000 + yr;
+
+  Serial.printf("  Time     : %04u-%02u-%02u %02u:%02u:%02u\n",
+                fullYear, month, day, hr, mn, sec);
+
+  // VL flag — critical: if set, time is not trustworthy
+  if (vlFlag) {
+    Serial.println("  VL flag  : SET  (voltage loss detected — time unreliable)");
+    Serial.println("  Battery  : FAIL (replace coin cell and re-set RTC time)");
+  } else {
+    Serial.println("  VL flag  : clear (OK)");
+    Serial.println("  Battery  : PASS (no voltage loss detected)");
+  }
+
+  bool yearOK = (fullYear >= 2025);
+  Serial.printf("  Year     : %s  (%u)\n",
+                yearOK ? "valid" : "INVALID (set RTC time)", fullYear);
+
+  // Control register 0x00 — check for unexpected reset (should be 0x00 after init)
+  Wire.beginTransmission(ADDR_PCF8563);
+  Wire.write(0x00);
+  Wire.endTransmission(false);
+  Wire.requestFrom(ADDR_PCF8563, (uint8_t)1);
+  uint8_t ctrl1 = Wire.available() ? Wire.read() : 0xFF;
+  bool stopBit  = (ctrl1 & 0x20) != 0;   // bit5 STOP = 1 means clock halted
+  Serial.printf("  Ctrl reg : 0x%02X  clock %s\n",
+                ctrl1, stopBit ? "HALTED (bit5 STOP=1)" : "running");
+
+  bool pass = !vlFlag && yearOK && !stopBit;
+  Serial.printf("  PCF8563  : %s\n", pass ? "PASS" : "FAIL");
+
+  if (!pass) {
+    if (vlFlag)   Serial.println("  [!] Replace coin cell and set RTC time");
+    if (!yearOK)  Serial.println("  [!] Set RTC: year reads < 2025");
+    if (stopBit)  Serial.println("  [!] Clock halted — write 0x00 to control reg 0x00");
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  RUN ALL I²C TESTS
+// ─────────────────────────────────────────────────────────────
+
+static void runI2CTests() {
+  Serial.println();
+  separator('=');
+  Serial.println("  I2C SUBSYSTEM TEST  v1.0.1");
+  separator('=');
+  Serial.println();
+
+  testBusScan();
+  testAS5600();
+  testINA226();
+  testPCF8563();
+
+  separator('=');
+  Serial.println("  Done. Send 'r' + Enter to re-run.");
+  separator('=');
+  Serial.println();
+}
+
+// ─────────────────────────────────────────────────────────────
+//  SETUP / LOOP
+// ─────────────────────────────────────────────────────────────
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  Wire.setClock(100000);
+  runI2CTests();
+}
+
+void loop() {
+  if (Serial.available()) {
+    char c = (char)Serial.read();
+    while (Serial.available()) Serial.read();
+    if (c == 'r' || c == 'R') runI2CTests();
+  }
+}
