@@ -1,0 +1,290 @@
+/*
+ * ============================================================
+ *  I²C STANDALONE TEST
+ *  ESP32-S3 Linear Actuator Controller
+ * ============================================================
+ *  Scans the I²C bus and validates AS5600, INA226, DS3231.
+ *  Send 'r' + Enter to re-run.
+ * ============================================================
+ */
+
+#define PIN_I2C_SDA   8
+#define PIN_I2C_SCL   9
+
+#define ADDR_AS5600  0x36
+#define ADDR_INA226  0x40
+#define ADDR_PCF8563  0x51
+#include <Arduino.h>
+#include <Wire.h>
+
+// ─────────────────────────────────────────────────────────────
+//  HELPERS
+// ─────────────────────────────────────────────────────────────
+
+static void separator(char c = '-', int n = 42) {
+  for (int i = 0; i < n; i++) Serial.print(c);
+  Serial.println();
+}
+
+static bool i2cPing(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission() == 0;
+}
+
+static uint16_t i2cRead16(uint8_t addr, uint8_t reg) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom(addr, (uint8_t)2);
+  if (Wire.available() < 2) return 0xFFFF;
+  uint8_t hi = Wire.read();
+  uint8_t lo = Wire.read();
+  return ((uint16_t)hi << 8) | lo;
+}
+
+static uint8_t bcd2dec(uint8_t bcd) {
+  return (bcd >> 4) * 10 + (bcd & 0x0F);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TEST A: BUS SCAN
+// ─────────────────────────────────────────────────────────────
+
+static bool testBusScan() {
+  separator('=');
+  Serial.println("TEST A: I2C Bus Scan");
+  separator();
+
+  bool foundAS5600 = false, foundINA226 = false, foundDS3231 = false;
+
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      const char* tag = "";
+      if (addr == ADDR_AS5600) { tag = "  <- AS5600";  foundAS5600 = true; }
+      if (addr == ADDR_INA226) { tag = "  <- INA226";  foundINA226 = true; }
+      if (addr == ADDR_DS3231) { tag = "  <- DS3231";  foundDS3231 = true; }
+      Serial.printf("  0x%02X%s\n", addr, tag);
+    }
+  }
+
+  Serial.println();
+  Serial.printf("  AS5600 0x36 : %s\n", foundAS5600 ? "FOUND" : "MISSING");
+  Serial.printf("  INA226 0x40 : %s\n", foundINA226 ? "FOUND" : "MISSING");
+  Serial.printf("  DS3231 0x68 : %s\n", foundDS3231 ? "FOUND" : "MISSING");
+
+  bool pass = foundAS5600 && foundINA226 && foundDS3231;
+  Serial.printf("  Bus Scan    : %s\n", pass ? "PASS" : "FAIL");
+  return pass;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TEST B: AS5600
+// ─────────────────────────────────────────────────────────────
+
+static void testAS5600() {
+  separator('=');
+  Serial.println("TEST B: AS5600 Magnetic Encoder");
+  separator();
+
+  if (!i2cPing(ADDR_AS5600)) {
+    Serial.println("  ERROR: AS5600 not responding  -> FAIL");
+    return;
+  }
+
+  // AGC register 0x1A: magnet detection bits
+  //   Bit 5 (MH) = 1 → too strong
+  //   Bit 4 (ML) = 1 → too weak
+  //   Bit 3 (MD) = 1 → magnet detected (OK)
+  Wire.beginTransmission(ADDR_AS5600);
+  Wire.write(0x1A);
+  Wire.endTransmission(false);
+  Wire.requestFrom(ADDR_AS5600, (uint8_t)1);
+  uint8_t agc = Wire.available() ? Wire.read() : 0xFF;
+
+  bool magnetOK     = (agc & 0x20) == 0 && (agc & 0x10) == 0;
+  bool magnetDetect = (agc & 0x08) != 0;
+  Serial.printf("  AGC reg 0x1A : 0x%02X\n", agc);
+  Serial.printf("  MD (magnet)  : %s\n", magnetDetect ? "detected" : "NOT detected");
+  Serial.printf("  MH (too str) : %s\n", (agc & 0x20) ? "YES (move magnet further)" : "no");
+  Serial.printf("  ML (too weak): %s\n", (agc & 0x10) ? "YES (move magnet closer)"  : "no");
+
+  // Raw angle (0x0C/0x0D) and filtered angle (0x0E/0x0F)
+  uint16_t rawAngle  = i2cRead16(ADDR_AS5600, 0x0C) & 0x0FFF;
+  uint16_t filtAngle = i2cRead16(ADDR_AS5600, 0x0E) & 0x0FFF;
+  float degrees = filtAngle * 360.0f / 4096.0f;
+
+  Serial.printf("  Raw Angle    : %u counts\n", rawAngle);
+  Serial.printf("  Filt Angle   : %u counts  (%.1f deg)\n", filtAngle, degrees);
+
+  bool pass = magnetDetect && magnetOK;
+  Serial.printf("  AS5600       : %s\n", pass ? "PASS" : "FAIL");
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TEST C: INA226
+// ─────────────────────────────────────────────────────────────
+
+static void testINA226() {
+  separator('=');
+  Serial.println("TEST C: INA226 Power Monitor");
+  separator();
+
+  if (!i2cPing(ADDR_INA226)) {
+    Serial.println("  ERROR: INA226 not responding  -> FAIL");
+    return;
+  }
+
+  // Read manufacturer ID register 0xFE — TI devices return 0x5449
+  uint16_t mfr = i2cRead16(ADDR_INA226, 0xFE);
+  Serial.printf("  Manufacturer ID : 0x%04X  %s\n",
+                mfr, (mfr == 0x5449) ? "(TI - correct)" : "(unexpected)");
+
+  // Read die ID register 0xFF — INA226 returns 0x2260
+  uint16_t die = i2cRead16(ADDR_INA226, 0xFF);
+  Serial.printf("  Die ID          : 0x%04X  %s\n",
+                die, (die == 0x2260) ? "(INA226 - correct)" : "(unexpected)");
+
+  // Config: 64 sample avg, 1.1ms conv, continuous shunt+bus
+  Wire.beginTransmission(ADDR_INA226);
+  Wire.write(0x00);
+  Wire.write(0x45); Wire.write(0x27);
+  bool cfgOK = (Wire.endTransmission() == 0);
+  Serial.printf("  Config write    : %s\n", cfgOK ? "OK" : "FAILED");
+
+  // Calibration: 0.00512 / (0.001 A/LSB * 0.1 ohm) = 512
+  Wire.beginTransmission(ADDR_INA226);
+  Wire.write(0x05);
+  Wire.write(0x02); Wire.write(0x00); // 512 = 0x0200
+  bool calOK = (Wire.endTransmission() == 0);
+  Serial.printf("  Cal write       : %s\n", calOK ? "OK" : "FAILED");
+
+  delay(200); // wait for first conversion
+
+  // Bus voltage: reg 0x02, 1.25 mV/LSB
+  int16_t busRaw = (int16_t)i2cRead16(ADDR_INA226, 0x02);
+  float busV = busRaw * 0.00125f;
+
+  // Shunt voltage: reg 0x01, 2.5 uV/LSB
+  int16_t shuntRaw = (int16_t)i2cRead16(ADDR_INA226, 0x01);
+  float shuntMV = shuntRaw * 0.0025f;
+
+  // Current: reg 0x04, 1 mA/LSB (per our calibration)
+  int16_t curRaw = (int16_t)i2cRead16(ADDR_INA226, 0x04);
+  float curA = curRaw * 0.001f;
+
+  Serial.printf("  Bus Voltage     : %.3f V\n", busV);
+  Serial.printf("  Shunt Voltage   : %.3f mV\n", shuntMV);
+  Serial.printf("  Current         : %.3f A\n", curA);
+
+  bool pass = (mfr == 0x5449) && cfgOK && calOK && (busV > 1.0f);
+  Serial.printf("  INA226          : %s\n", pass ? "PASS" : "FAIL");
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TEST D: DS3231
+// ─────────────────────────────────────────────────────────────
+
+static void testDS3231() {
+  separator('=');
+  Serial.println("TEST D: DS3231 RTC");
+  separator();
+
+  if (!i2cPing(ADDR_DS3231)) {
+    Serial.println("  ERROR: DS3231 not responding  -> FAIL");
+    return;
+  }
+
+  // Read 7 time registers starting at 0x00
+  Wire.beginTransmission(ADDR_DS3231);
+  Wire.write(0x00);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("  ERROR: DS3231 write failed  -> FAIL");
+    return;
+  }
+
+  Wire.requestFrom(ADDR_DS3231, (uint8_t)7);
+  if (Wire.available() < 7) {
+    Serial.println("  ERROR: DS3231 incomplete read  -> FAIL");
+    return;
+  }
+
+  uint8_t sec  = bcd2dec(Wire.read() & 0x7F);
+  uint8_t mn   = bcd2dec(Wire.read() & 0x7F);
+  uint8_t hr   = bcd2dec(Wire.read() & 0x3F);
+  /* dow */      Wire.read();
+  uint8_t day  = bcd2dec(Wire.read());
+  uint8_t mo   = bcd2dec(Wire.read() & 0x1F);
+  uint8_t yr   = bcd2dec(Wire.read());
+  uint16_t fullYear = 2000 + yr;
+
+  Serial.printf("  Time  : %04u-%02u-%02u %02u:%02u:%02u\n",
+                fullYear, mo, day, hr, mn, sec);
+
+  // Read temperature registers 0x11 (MSB) and 0x12 (LSB, bits 7:6 = 0.25°C steps)
+  Wire.beginTransmission(ADDR_DS3231);
+  Wire.write(0x11);
+  Wire.endTransmission(false);
+  Wire.requestFrom(ADDR_DS3231, (uint8_t)2);
+  float tempC = 0;
+  if (Wire.available() >= 2) {
+    int8_t  tMSB = (int8_t)Wire.read();
+    uint8_t tLSB = Wire.read();
+    tempC = tMSB + ((tLSB >> 6) * 0.25f);
+  }
+  Serial.printf("  Temp  : %.2f C\n", tempC);
+
+  bool yearOK = (fullYear >= 2025);
+  bool tempOK = (tempC > 0.0f && tempC < 85.0f);
+  Serial.printf("  Year  : %s  (%u)\n",     yearOK ? "valid" : "INVALID (set RTC or replace battery)", fullYear);
+  Serial.printf("  Temp  : %s  (%.2f C)\n", tempOK ? "valid" : "out of range", tempC);
+
+  bool pass = yearOK && tempOK;
+  Serial.printf("  DS3231: %s\n", pass ? "PASS" : "FAIL");
+  if (yearOK)
+    Serial.println("  Batt  : PASS  (year valid -> battery maintained time)");
+  else
+    Serial.println("  Batt  : FAIL  (year invalid -> replace coin cell)");
+}
+
+// ─────────────────────────────────────────────────────────────
+//  RUN ALL I²C TESTS
+// ─────────────────────────────────────────────────────────────
+
+static void runI2CTests() {
+  Serial.println();
+  separator('=');
+  Serial.println("  I2C SUBSYSTEM TEST");
+  separator('=');
+  Serial.println();
+
+  testBusScan();
+  testAS5600();
+  testINA226();
+  testDS3231();
+
+  separator('=');
+  Serial.println("  Done. Send 'r' + Enter to re-run.");
+  separator('=');
+  Serial.println();
+}
+
+// ─────────────────────────────────────────────────────────────
+//  SETUP / LOOP
+// ─────────────────────────────────────────────────────────────
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  Wire.setClock(100000);
+  runI2CTests();
+}
+
+void loop() {
+  if (Serial.available()) {
+    char c = (char)Serial.read();
+    while (Serial.available()) Serial.read();
+    if (c == 'r' || c == 'R') runI2CTests();
+  }
+}
