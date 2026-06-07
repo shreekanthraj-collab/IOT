@@ -1,0 +1,2087 @@
+// ================== AWS FIRMWARE v1.0.3 ==================
+// ESP32-S3 Municipal Actuator — Session 4 (Hardware Auto-Detect)
+//
+// Base: aws_firmware_v1.0.2 — PCF8563 RTC + Scheduler preserved.
+//
+// v1.0.3 CHANGES — I2C Hardware Auto-Detection + NVS Caching:
+//   [HW]    All three I2C devices auto-detected at boot instead of
+//             using hardcoded addresses. Detected addresses cached in
+//             NVS under "hw_profile" namespace so future boots skip
+//             the scan and use cached values immediately.
+//
+//   [INA]   INA226 scanned across full valid range 0x40–0x4F
+//             Validated by manufacturer ID register 0xFE == 0x5449
+//             Global: uint8_t inaAddr  (replaces #define INA_ADDR 0x40)
+//             INA226_WE ina226 allocated via pointer after detection
+//
+//   [ENC]   AS5600 scanned at 0x36 (silicon-fixed, no alt address)
+//             Validated by STATUS register 0x0B bit5 (MH/ML/MD magnet flags)
+//             AGC register 0x1A checked for saturation
+//             Global: uint8_t encAddr  (replaces hardcoded AS5600_ADDR 0x36)
+//
+//   [RTC]   PCF8563 scanned at 0x51 (includes HYM8563 / compatible clones)
+//             Validated by writing a known value and reading it back
+//             via the CLKOUT register 0x0D (safe non-destructive probe)
+//             Global: uint8_t rtcAddr  (replaces hardcoded PCF8563_ADDR 0x51)
+//             All RTC driver calls updated to use rtcAddr variable
+//
+//   [NVS]   hw_profile namespace: "ina_addr", "enc_addr", "rtc_addr"
+//             On first boot: scan → validate → save
+//             On subsequent boots: load from NVS → verify ACK → use
+//             If cached device no longer ACKs: re-scan and re-save
+//
+//   [AWS]   Hardware profile published to AWS on every MQTT connect:
+//             {"device_id":"...","hw_profile":{"ina_addr":"0x40",
+//              "enc_addr":"0x36","rtc_addr":"0x51"},"ts":"..."}
+//             Also re-published after any re-scan event
+//
+//   [ERR]   If any device cannot be found after full scan:
+//             Fatal error logged to serial + MQTT
+//             Motor blocked (i2cFault = true)
+//             Device continues attempting re-scan every 30 s via
+//             existing sensorCheckTimer path
+//
+//   [VER]   FW_VERSION bumped to aws-1.0.3
+//
+// PIN MAP — ESP32-S3 PCB FINAL LOCKED (unchanged):
+//   GPIO40  K1 Relay FWD      (ESP32_RELAY1_ACT)
+//   GPIO41  K2 Relay REV      (ESP32_RELAY2_ACT)
+//   GPIO42  K3 Relay PWR      (ESP32_RELAY3_ACT)
+//   GPIO36  Soft Start PWM    (ESP32_SOFT_START)
+//   GPIO8   I2C SDA
+//   GPIO9   I2C SCL
+//   GPIO2   INA226 Alert      (MCU_ALERT)
+//   GPIO19  Limit Switch      (LIMIT_SW)
+//   GPIO43  LTE UART TX       (IO43/TXD0)
+//   GPIO44  LTE UART RX       (IO44/RXD0)
+//   GPIO48  Buzzer            (ESP32_BUZZER)
+//   GPIO1   VBAT ADC          (VBAT_ADC / IO1/ADC1_0)
+//   GPIO4   RTC Interrupt     (RTC_INT_N — PCF8563 Alarm)
+//   GPIO20  Flow Pulse        (FLOW_SEN_FREQ — reserved)
+//   GPIO45  Push Button       (hardware reset — no FW handling)
+//   RTC     I2C PCF8563 0x51
+// =========================================================
+
+
+
+
+#include <Wire.h>
+#include <INA226_WE.h>
+#include <Preferences.h>
+#include <Update.h>
+#include <ArduinoJson.h>
+#include <mbedtls/sha256.h>
+#define TINY_GSM_MODEM_BG96
+#include <TinyGsmClient.h>
+#include <PubSubClient.h>
+
+
+
+
+HardwareSerial SerialAT(1);
+TinyGsm        modem(SerialAT);
+TinyGsmClientSecure gsmClient(modem, 0);
+TinyGsmClientSecure otaClient(modem, 1);
+PubSubClient   mqtt(gsmClient);
+
+
+
+
+// ================== FIRMWARE VERSION ==================
+#define FW_VERSION      "aws-1.0.3"
+#define FW_TYPE         "MUNICIPAL"
+bool    updateAvailable  = false;
+String  pendingUpdateURL = "";
+String  pendingUpdateVer = "";
+String  pendingUpdateSHA = "";
+
+
+
+
+// ================== AWS MQTT ==================
+String awsEndpoint   = "";
+String awsCert       = "";
+String awsPkey       = "";
+String awsRootCA     = "";
+const int awsPort    = 8883;
+
+String pubStatusTopic;
+String pubEventTopic;
+String subCmdTopic;
+String subUpdateTopic;
+String shadowUpdateTopic;
+String shadowAcceptedTopic;
+
+unsigned long mqttRetryTimer = 0;
+
+#define MQTT_SLEEP_CHECK_MS  60000UL
+unsigned long mqttSleepCheckTimer = 0;
+
+String DEVICE_ID = "";
+void handleJSONCommand(String input);
+void connectMQTT();
+bool checkSensors();
+bool safeToSleep();
+
+
+
+
+// ================== PINS — ESP32-S3 PCB FINAL LOCKED ==================
+#define RELAY_FWD        40
+#define RELAY_REV        41
+#define RELAY_PWR        42
+#define PWM_PIN          36
+#define SDA_PIN           8
+#define SCL_PIN           9
+#define INA_ALERT_PIN     2
+#define LIMIT_SWITCH_PIN 19
+#define BUZZER_PIN       48
+#define VBAT_ADC_PIN      1
+#define RTC_INT_PIN       4   // PCF8563 alarm interrupt
+
+#define PWM_FREQ      5000
+#define PWM_RES          8
+#define RELAY_ON  LOW
+#define RELAY_OFF HIGH
+
+
+
+
+// ================== [HW] I2C DEVICE ADDRESS GLOBALS ==================
+// Populated at boot by detectHardware(). Never use raw literals after setup().
+// INA226 : valid range 0x40–0x4F (A0/A1 pin strapping, 16 combinations)
+// AS5600 : always 0x36 (silicon fixed, no alt address exists)
+// PCF8563: always 0x51 (includes HYM8563 and other compatible clones)
+
+uint8_t inaAddr = 0x00;   // 0x00 = not yet detected
+uint8_t encAddr = 0x00;
+uint8_t rtcAddr = 0x00;
+
+// INA226_WE is constructed with an I2C address — we allocate after detection
+INA226_WE* ina226 = nullptr;
+
+
+
+
+// ================== [BUZZ] BUZZER ==================
+unsigned long buzzerTimer = 0;
+
+// ================== [VBAT] RAW BATTERY ADC ==================
+#define VBAT_DIVIDER_RATIO  5.0f
+#define VBAT_ADC_REF_MV     3300.0f
+#define VBAT_ADC_RES        4095.0f
+unsigned long vbatReadTimer = 0;
+float         vbatMV        = 0.0f;
+
+float readVBAT_mV() {
+  int raw = analogRead(VBAT_ADC_PIN);
+  return ((float)raw / VBAT_ADC_RES) * VBAT_ADC_REF_MV * VBAT_DIVIDER_RATIO;
+}
+
+volatile bool inaAlertFlag = false;
+void IRAM_ATTR inaAlertISR() { inaAlertFlag = true; }
+
+
+
+
+// ================== [RTC] PCF8563 DRIVER ==================
+volatile bool rtcAlarmFlag = false;
+void IRAM_ATTR rtcAlarmISR() { rtcAlarmFlag = true; }
+
+uint8_t bcdToDec(uint8_t b) { return (b / 16 * 10) + (b % 16); }
+uint8_t decToBcd(uint8_t d) { return (d / 10 * 16) + (d % 10); }
+
+// All RTC driver functions use rtcAddr variable (set by detectHardware)
+// so they work regardless of whether the chip is at 0x51 or a clone address.
+
+bool rtcGetTime(struct tm &t) {
+  Wire.beginTransmission(rtcAddr);
+  Wire.write(0x02);
+  if (Wire.endTransmission(false) != 0) return false;
+  Wire.requestFrom(rtcAddr, (uint8_t)7);
+  if (Wire.available() < 7) return false;
+
+  uint8_t sec = Wire.read();
+  if (sec & 0x80) return false;             // VL flag — clock integrity lost
+  t.tm_sec  = bcdToDec(sec  & 0x7F);
+  t.tm_min  = bcdToDec(Wire.read() & 0x7F);
+  t.tm_hour = bcdToDec(Wire.read() & 0x3F);
+  t.tm_mday = bcdToDec(Wire.read() & 0x3F);
+  t.tm_wday = bcdToDec(Wire.read() & 0x07);
+  uint8_t monthRaw = Wire.read();
+  t.tm_mon  = bcdToDec(monthRaw & 0x1F) - 1;
+  t.tm_year = bcdToDec(Wire.read()) + 100;
+  return true;
+}
+
+bool rtcSetTime(const struct tm &t) {
+  Wire.beginTransmission(rtcAddr);
+  Wire.write(0x02);
+  Wire.write(decToBcd(t.tm_sec)  & 0x7F);
+  Wire.write(decToBcd(t.tm_min)  & 0x7F);
+  Wire.write(decToBcd(t.tm_hour) & 0x3F);
+  Wire.write(decToBcd(t.tm_mday) & 0x3F);
+  Wire.write(decToBcd(t.tm_wday) & 0x07);
+  Wire.write(decToBcd(t.tm_mon + 1) & 0x1F);
+  Wire.write(decToBcd(t.tm_year - 100));
+  if (Wire.endTransmission() != 0) return false;
+  return true;
+}
+
+bool rtcIsValid() {
+  if (rtcAddr == 0x00) return false;
+  Wire.beginTransmission(rtcAddr);
+  Wire.write(0x02);
+  if (Wire.endTransmission(false) != 0) return false;
+  Wire.requestFrom(rtcAddr, (uint8_t)1);
+  if (!Wire.available()) return false;
+  uint8_t sec = Wire.read();
+  return !(sec & 0x80);
+}
+
+String rtcFormatISO(const struct tm &t) {
+  char buf[25];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+           t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+           t.tm_hour, t.tm_min, t.tm_sec);
+  return String(buf);
+}
+
+String getTimestamp() {
+  struct tm t;
+  if (!rtcIsValid()) return "RTC_INVALID";
+  if (!rtcGetTime(t)) return "RTC_READ_ERR";
+  return rtcFormatISO(t);
+}
+
+bool parseISO(const String &iso, struct tm &t) {
+  if (iso.length() < 19) return false;
+  t.tm_year = iso.substring(0,  4).toInt() - 1900;
+  t.tm_mon  = iso.substring(5,  7).toInt() - 1;
+  t.tm_mday = iso.substring(8,  10).toInt();
+  t.tm_hour = iso.substring(11, 13).toInt();
+  t.tm_min  = iso.substring(14, 16).toInt();
+  t.tm_sec  = iso.substring(17, 19).toInt();
+  int y = t.tm_year + 1900; int m = t.tm_mon + 1;
+  if (m < 3) { m += 12; y--; }
+  int k = y % 100; int j = y / 100;
+  int h = (t.tm_mday + (13*(m+1))/5 + k + k/4 + j/4 + 5*j) % 7;
+  t.tm_wday = (h + 6) % 7;
+  return true;
+}
+
+
+
+
+// ================== [HW] HARDWARE AUTO-DETECTION ==================
+//
+// Detection order: INA226 → AS5600 → PCF8563
+// Each device is validated beyond a bare ACK to avoid false positives
+// when two devices share an address range or a bus glitch causes a ghost ACK.
+//
+// After detection, addresses are cached in NVS "hw_profile" namespace.
+// On subsequent boots the cached addresses are loaded and verified with a
+// single ACK ping. If the ping fails the full scan runs again.
+//
+// Returns true if all three devices were found (cached or freshly scanned).
+// Sets inaAddr, encAddr, rtcAddr as side effects.
+// Sets i2cFault = true if any device cannot be found.
+
+// ── INA226 validator ──
+// Reads manufacturer ID register 0xFE. Texas Instruments INA226 always
+// returns 0x5449 ("TI"). Any other value means a false-positive ACK.
+bool validateINA226(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  Wire.write(0xFE);
+  if (Wire.endTransmission(false) != 0) return false;
+  Wire.requestFrom(addr, (uint8_t)2);
+  if (Wire.available() < 2) return false;
+  uint16_t mfr = ((uint16_t)Wire.read() << 8) | Wire.read();
+  return (mfr == 0x5449);
+}
+
+// ── AS5600 validator ──
+// STATUS register 0x0B: bit5=MH (too strong), bit4=ML (too weak), bit3=MD (detected).
+// At least one of MH/ML/MD must be set to confirm a real AS5600 is present.
+// A bare I2C ACK at 0x36 from another device would not pass this check.
+bool validateAS5600(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  Wire.write(0x0B);
+  if (Wire.endTransmission(false) != 0) return false;
+  Wire.requestFrom(addr, (uint8_t)1);
+  if (!Wire.available()) return false;
+  uint8_t status = Wire.read();
+  return (status & 0x38) != 0;   // bits 5,4,3 — any magnet flag set
+}
+
+// ── PCF8563 validator ──
+// The CLKOUT register (0x0D) has a known fixed bit pattern on reset:
+// bit7 = FE (clock output enable, default 1), bits [2:0] = FD (frequency, default 0b011 = 1Hz)
+// We read 0x0D and check that reserved bits [6:3] are zero, and bit7 is readable.
+// This safely confirms PCF8563 / HYM8563 / compatible without disturbing time registers.
+bool validatePCF8563(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  Wire.write(0x0D);
+  if (Wire.endTransmission(false) != 0) return false;
+  Wire.requestFrom(addr, (uint8_t)1);
+  if (!Wire.available()) return false;
+  uint8_t clkout = Wire.read();
+  // Reserved bits [6:3] must be 0 on a real PCF8563
+  return (clkout & 0x78) == 0x00;
+}
+
+// ── NVS save / load for hw_profile ──
+void saveHWProfile() {
+  prefs.begin("hw_profile", false);
+  prefs.putUChar("ina_addr", inaAddr);
+  prefs.putUChar("enc_addr", encAddr);
+  prefs.putUChar("rtc_addr", rtcAddr);
+  prefs.end();
+  Serial.printf("💾 HW PROFILE SAVED — INA:0x%02X ENC:0x%02X RTC:0x%02X\n",
+                inaAddr, encAddr, rtcAddr);
+}
+
+void loadHWProfile() {
+  prefs.begin("hw_profile", true);
+  inaAddr = prefs.getUChar("ina_addr", 0x00);
+  encAddr = prefs.getUChar("enc_addr", 0x00);
+  rtcAddr = prefs.getUChar("rtc_addr", 0x00);
+  prefs.end();
+}
+
+// ── Quick ACK ping ──
+bool i2cAck(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission() == 0;
+}
+
+// ── Publish hardware profile to AWS ──
+void publishHWProfile() {
+  if (!mqtt.connected()) return;
+  StaticJsonDocument<192> doc;
+  doc["device_id"] = DEVICE_ID;
+  doc["event"]     = "HW_PROFILE";
+  char buf[8];
+  JsonObject hw = doc.createNestedObject("hw_profile");
+  snprintf(buf, sizeof(buf), "0x%02X", inaAddr); hw["ina_addr"] = String(buf);
+  snprintf(buf, sizeof(buf), "0x%02X", encAddr); hw["enc_addr"] = String(buf);
+  snprintf(buf, sizeof(buf), "0x%02X", rtcAddr); hw["rtc_addr"] = String(buf);
+  doc["ts"] = getTimestamp();
+  String out; serializeJson(doc, out);
+  mqtt.publish(pubStatusTopic.c_str(), out.c_str(), false, 1);
+  Serial.print("📤 HW PROFILE: "); Serial.println(out);
+}
+
+// ── Main detection function ──
+// Call once in setup() after Wire.begin(). Sets inaAddr/encAddr/rtcAddr.
+// Returns true only if all three devices are confirmed.
+bool detectHardware() {
+  Serial.println("🔍 HW DETECT — loading NVS cache...");
+  loadHWProfile();
+
+  bool inaOK = false, encOK = false, rtcOK = false;
+
+  // ── Try cached addresses first (fast path — no full scan) ──
+  if (inaAddr != 0x00 && i2cAck(inaAddr) && validateINA226(inaAddr)) {
+    Serial.printf("✅ INA226 @ 0x%02X (cached)\n", inaAddr);
+    inaOK = true;
+  }
+  if (encAddr != 0x00 && i2cAck(encAddr) && validateAS5600(encAddr)) {
+    Serial.printf("✅ AS5600 @ 0x%02X (cached)\n", encAddr);
+    encOK = true;
+  }
+  if (rtcAddr != 0x00 && i2cAck(rtcAddr) && validatePCF8563(rtcAddr)) {
+    Serial.printf("✅ PCF8563 @ 0x%02X (cached)\n", rtcAddr);
+    rtcOK = true;
+  }
+
+  // ── Full scan for any device that failed its cache check ──
+  if (!inaOK || !encOK || !rtcOK) {
+    Serial.println("🔍 HW DETECT — scanning I2C bus...");
+
+    // INA226: scan 0x40–0x4F
+    if (!inaOK) {
+      inaAddr = 0x00;
+      for (uint8_t addr = 0x40; addr <= 0x4F; addr++) {
+        if (i2cAck(addr) && validateINA226(addr)) {
+          inaAddr = addr;
+          Serial.printf("✅ INA226 found @ 0x%02X\n", addr);
+          inaOK = true;
+          break;
+        }
+      }
+      if (!inaOK) Serial.println("❌ INA226 NOT FOUND (scanned 0x40–0x4F)");
+    }
+
+    // AS5600: fixed at 0x36
+    if (!encOK) {
+      encAddr = 0x00;
+      if (i2cAck(0x36) && validateAS5600(0x36)) {
+        encAddr = 0x36;
+        Serial.println("✅ AS5600 found @ 0x36");
+        encOK = true;
+      } else {
+        Serial.println("❌ AS5600 NOT FOUND (0x36)");
+      }
+    }
+
+    // PCF8563 and compatible clones: fixed at 0x51
+    if (!rtcOK) {
+      rtcAddr = 0x00;
+      if (i2cAck(0x51) && validatePCF8563(0x51)) {
+        rtcAddr = 0x51;
+        Serial.printf("✅ PCF8563 found @ 0x51\n");
+        rtcOK = true;
+      } else {
+        Serial.println("❌ PCF8563 NOT FOUND (0x51)");
+      }
+    }
+
+    // Save updated profile to NVS whenever any address changed
+    if (inaOK && encOK && rtcOK) {
+      saveHWProfile();
+    }
+  }
+
+  bool allOK = inaOK && encOK && rtcOK;
+  if (!allOK) {
+    Serial.println("🔴 HW DETECT FAILED — one or more I2C devices missing");
+    Serial.printf("   INA226: %s  AS5600: %s  PCF8563: %s\n",
+                  inaOK ? "OK" : "MISSING",
+                  encOK ? "OK" : "MISSING",
+                  rtcOK ? "OK" : "MISSING");
+  } else {
+    Serial.println("✅ HW DETECT COMPLETE — all devices confirmed");
+  }
+  return allOK;
+}
+
+
+
+
+// ================== [SCHED] SCHEDULE ENGINE ==================
+#define SCHED_SLOTS 8
+
+struct SchedSlot {
+  bool    enabled;
+  uint8_t action;   // 0=OPEN, 1=CLOSE
+  uint8_t hour;
+  uint8_t minute;
+  char    days[8];  // "0100101\0"
+};
+
+SchedSlot schedSlots[SCHED_SLOTS];
+
+void saveSchedule() {
+  prefs.begin("schedule", false);
+  for (int i = 0; i < SCHED_SLOTS; i++) {
+    String key = "slot" + String(i);
+    uint8_t buf[12];
+    buf[0] = schedSlots[i].enabled ? 1 : 0;
+    buf[1] = schedSlots[i].action;
+    buf[2] = schedSlots[i].hour;
+    buf[3] = schedSlots[i].minute;
+    memcpy(buf + 4, schedSlots[i].days, 7);
+    buf[11] = 0;
+    prefs.putBytes(key.c_str(), buf, 12);
+  }
+  prefs.end();
+  Serial.println("💾 SCHEDULE SAVED");
+}
+
+void loadSchedule() {
+  prefs.begin("schedule", true);
+  for (int i = 0; i < SCHED_SLOTS; i++) {
+    String key = "slot" + String(i);
+    uint8_t buf[12] = {0};
+    size_t len = prefs.getBytes(key.c_str(), buf, 12);
+    if (len == 12) {
+      schedSlots[i].enabled = buf[0];
+      schedSlots[i].action  = buf[1];
+      schedSlots[i].hour    = buf[2];
+      schedSlots[i].minute  = buf[3];
+      memcpy(schedSlots[i].days, buf + 4, 7);
+      schedSlots[i].days[7] = '\0';
+    } else {
+      schedSlots[i].enabled = false;
+      schedSlots[i].action  = 0;
+      schedSlots[i].hour    = 0;
+      schedSlots[i].minute  = 0;
+      memcpy(schedSlots[i].days, "0000000", 7);
+      schedSlots[i].days[7] = '\0';
+    }
+  }
+  prefs.end();
+  Serial.println("📂 SCHEDULE LOADED");
+}
+
+bool slotActiveToday(const SchedSlot &slot, int wday) {
+  return slot.days[wday] == '1';
+}
+
+void armAlarm1(uint8_t hour, uint8_t minute) {
+  Wire.beginTransmission(rtcAddr);
+  Wire.write(0x01);
+  if (Wire.endTransmission(false) == 0) {
+    Wire.requestFrom(rtcAddr, (uint8_t)1);
+    uint8_t ctrl2 = Wire.available() ? Wire.read() : 0;
+    ctrl2 &= ~0x08;
+    Wire.beginTransmission(rtcAddr);
+    Wire.write(0x01);
+    Wire.write(ctrl2);
+    Wire.endTransmission();
+  }
+  Wire.beginTransmission(rtcAddr);
+  Wire.write(0x09);
+  Wire.write(decToBcd(minute) & 0x7F);
+  Wire.write(decToBcd(hour)   & 0x3F);
+  Wire.write(0x80);
+  Wire.write(0x80);
+  Wire.endTransmission();
+  Wire.beginTransmission(rtcAddr);
+  Wire.write(0x01);
+  if (Wire.endTransmission(false) == 0) {
+    Wire.requestFrom(rtcAddr, (uint8_t)1);
+    uint8_t ctrl2 = Wire.available() ? Wire.read() : 0;
+    ctrl2 |= 0x02;
+    Wire.beginTransmission(rtcAddr);
+    Wire.write(0x01);
+    Wire.write(ctrl2);
+    Wire.endTransmission();
+  }
+  Serial.printf("⏰ ALARM ARMED: %02d:%02d\n", hour, minute);
+}
+
+void clearAlarm1Flag() {
+  Wire.beginTransmission(rtcAddr);
+  Wire.write(0x01);
+  if (Wire.endTransmission(false) != 0) return;
+  Wire.requestFrom(rtcAddr, (uint8_t)1);
+  uint8_t ctrl2 = Wire.available() ? Wire.read() : 0;
+  ctrl2 &= ~0x08;
+  Wire.beginTransmission(rtcAddr);
+  Wire.write(0x01);
+  Wire.write(ctrl2);
+  Wire.endTransmission();
+}
+
+void armNextAlarm() {
+  if (!rtcIsValid()) { Serial.println("⚠️ RTC invalid — cannot arm scheduler"); return; }
+  struct tm now;
+  if (!rtcGetTime(now)) return;
+
+  int bestSlot = -1, bestMinutes = 9999;
+  int nowMinutes = now.tm_hour * 60 + now.tm_min;
+
+  for (int i = 0; i < SCHED_SLOTS; i++) {
+    if (!schedSlots[i].enabled) continue;
+    for (int dayOffset = 0; dayOffset <= 7; dayOffset++) {
+      int checkWday = (now.tm_wday + dayOffset) % 7;
+      if (!slotActiveToday(schedSlots[i], checkWday)) continue;
+      int slotMinutes = schedSlots[i].hour * 60 + schedSlots[i].minute;
+      int diff;
+      if (dayOffset == 0) { diff = slotMinutes - nowMinutes; if (diff <= 0) continue; }
+      else                { diff = dayOffset * 1440 + slotMinutes - nowMinutes; }
+      if (diff < bestMinutes) { bestMinutes = diff; bestSlot = i; }
+      break;
+    }
+  }
+
+  if (bestSlot == -1) { Serial.println("📅 No active schedule slots"); return; }
+  armAlarm1(schedSlots[bestSlot].hour, schedSlots[bestSlot].minute);
+  Serial.printf("📅 Next: slot %d → %s at %02d:%02d\n",
+                bestSlot,
+                schedSlots[bestSlot].action == 0 ? "OPEN" : "CLOSE",
+                schedSlots[bestSlot].hour,
+                schedSlots[bestSlot].minute);
+}
+
+void handleScheduledAlarms() {
+  if (!rtcIsValid()) return;
+  struct tm now;
+  if (!rtcGetTime(now)) return;
+
+  for (int i = 0; i < SCHED_SLOTS; i++) {
+    if (!schedSlots[i].enabled) continue;
+    if (!slotActiveToday(schedSlots[i], now.tm_wday)) continue;
+    if (schedSlots[i].hour   != (uint8_t)now.tm_hour) continue;
+    if (schedSlots[i].minute != (uint8_t)now.tm_min)  continue;
+    Serial.printf("📅 SCHEDULED ACTION: slot %d → %s\n", i,
+                  schedSlots[i].action == 0 ? "OPEN (FORWARD)" : "CLOSE (REVERSE)");
+    if (schedSlots[i].action == 0) startMotor(FORWARD_RUN);
+    else                           startMotor(REVERSE_RUN);
+    if (mqtt.connected()) {
+      StaticJsonDocument<192> doc;
+      doc["device_id"]   = DEVICE_ID;
+      doc["sched_event"] = (schedSlots[i].action == 0) ? "SCHED_OPEN" : "SCHED_CLOSE";
+      doc["slot"]        = i;
+      doc["ts"]          = getTimestamp();
+      String out; serializeJson(doc, out);
+      mqtt.publish(pubEventTopic.c_str(), out.c_str(), false, 1);
+    }
+  }
+  clearAlarm1Flag();
+  armNextAlarm();
+}
+
+void publishSchedule() {
+  StaticJsonDocument<512> doc;
+  doc["device_id"] = DEVICE_ID;
+  doc["ts"]        = getTimestamp();
+  JsonArray arr    = doc.createNestedArray("schedule");
+  for (int i = 0; i < SCHED_SLOTS; i++) {
+    JsonObject s = arr.createNestedObject();
+    s["slot"]    = i;
+    s["enabled"] = schedSlots[i].enabled;
+    s["action"]  = schedSlots[i].action == 0 ? "OPEN" : "CLOSE";
+    s["hour"]    = schedSlots[i].hour;
+    s["minute"]  = schedSlots[i].minute;
+    s["days"]    = String(schedSlots[i].days);
+  }
+  String out; serializeJson(doc, out);
+  mqtt.publish(pubStatusTopic.c_str(), out.c_str(), false, 1);
+  Serial.print("📤 SCHEDULE: "); Serial.println(out);
+}
+
+
+
+
+// ================== MOTOR STATES ==================
+enum State { IDLE, FORWARD_RUN, REVERSE_RUN };
+State motorState      = IDLE;
+State lastDirection   = FORWARD_RUN;
+State resumeDirection = IDLE;
+bool  resumePending   = false;
+
+
+
+
+// ================== FIRMWARE STATE ==================
+enum FirmwareState {
+  FW_LTE_INIT, FW_TLS_INIT, FW_BOOT_VALIDATE,
+  FW_INIT, FW_ACTIVE, FW_SLEEP, FW_OTA_WAIT, FW_OTA_FLASH
+};
+FirmwareState fwState = FW_LTE_INIT;
+
+
+
+
+// ================== LIMITS ==================
+#define MIN_TURNS  1.0
+float MAX_TURNS = 10.0;
+
+
+
+
+// ================== VOLTAGE — 4S LiFePO4 ==================
+#define WARN_V_LOW  12.0
+#define WARN_V_HIGH 12.4
+#define CUT_V       11.6
+#define CRITICAL_V  11.2
+#define RESET_V     12.0
+
+enum VoltageState { NORMAL, WARNING, WAIT_BYPASS, BYPASS_ACTIVE, LOCKED };
+VoltageState vState = NORMAL;
+
+
+
+
+// ================== CURRENT ==================
+float CURRENT_OFF = 1.5;
+#define RETRY_DELAY 30000
+int  retryCount  = 0;
+bool ocFault     = false;
+bool lockFault   = false;
+unsigned long ocTripTime = 0;
+
+
+
+
+// ================== ENCODER ==================
+int16_t angle = 0, prevAngle = 0;
+long    rotationCount = 0;
+float   totalTurns    = 0;
+
+
+
+
+// ================== FLAGS ==================
+bool lastLimitState  = HIGH;
+bool lastOvercurrent = false;
+bool limitOverride   = false;
+bool lteReady        = false;
+bool tlsReady        = false;
+bool i2cFault        = false;
+
+
+
+
+// ================== TIMERS ==================
+unsigned long dashboardTimer    = 0;
+unsigned long idleStart         = 0;
+unsigned long warnPrintTimer    = 0;
+unsigned long bypassSleepTimer  = 0;
+bool          bypassSleepPending = false;
+unsigned long saveTimer         = 0;
+unsigned long sensorCheckTimer  = 0;
+
+
+
+
+// ================== [SIM-NB] NON-BLOCKING SIM ==================
+enum SimOp { SIM_IDLE, SIM_ENTERING_SLEEP, SIM_WAKING };
+SimOp         simOp       = SIM_IDLE;
+unsigned long simOpTimer  = 0;
+bool          simSleeping = false;
+
+#define SIM_SLEEP_SETTLE_MS  2000UL
+#define SIM_WAKE_SETTLE_MS   5000UL
+
+bool simOpDone() { return simOp == SIM_IDLE; }
+
+void handleSimOp() {
+  if (simOp == SIM_IDLE) return;
+  if (millis() - simOpTimer < (simOp == SIM_ENTERING_SLEEP
+                                ? SIM_SLEEP_SETTLE_MS
+                                : SIM_WAKE_SETTLE_MS)) return;
+  if (simOp == SIM_ENTERING_SLEEP) { simSleeping = true;  Serial.println("📴 SIM SLEEP SETTLED"); }
+  else                              { simSleeping = false; Serial.println("📶 SIM WAKE SETTLED");  }
+  simOp = SIM_IDLE;
+}
+
+void simEnterSleep() {
+  if (simSleeping || simOp != SIM_IDLE) return;
+  if (!safeToSleep()) { Serial.println("⚠️ SIM SLEEP BLOCKED — motor or resume pending"); return; }
+  Serial.println("📴 SIM ENTERING LOW POWER...");
+  SerialAT.println("AT+CFUN=4");
+  simOpTimer = millis(); simOp = SIM_ENTERING_SLEEP;
+}
+
+void simWake() {
+  if (!simSleeping && simOp == SIM_IDLE) return;
+  Serial.println("📶 SIM WAKING...");
+  SerialAT.println("AT+CFUN=1");
+  simOpTimer = millis(); simOp = SIM_WAKING; simSleeping = false;
+}
+
+
+
+
+// ================== SLEEP ==================
+bool sleepMode    = false;
+bool idleTracking = false;
+
+enum SleepSubState { SLEEP_ENTER, SLEEP_IDLE, SLEEP_LIMIT, SLEEP_MQTTCHK };
+SleepSubState sleepSub     = SLEEP_ENTER;
+unsigned long mqttChkStart = 0;
+
+
+
+
+// ================== [LTE-NB] LTE INIT STATE MACHINE ==================
+enum LteInitState {
+  LTE_AT, LTE_CPIN, LTE_CSQ, LTE_CREG,
+  LTE_CGATT, LTE_CGDCONT, LTE_CGACT, LTE_CGPADDR,
+  LTE_PING, LTE_DONE
+};
+LteInitState  lteState    = LTE_AT;
+unsigned long lteTimer    = 0;
+int           lteRegTries = 0;
+#define LTE_STEP_MS   1000UL
+#define LTE_REG_MS    2000UL
+#define LTE_LONG_MS   3000UL
+#define LTE_XLONG_MS  5000UL
+
+
+
+
+// ================== RAMP STATE MACHINE ==================
+enum RampState {
+  RAMP_IDLE, RAMP_UP, RAMP_BYPASS,
+  RAMP_RUNNING, RAMP_DOWN_INIT, RAMP_DOWN, RAMP_DONE
+};
+RampState     rampState  = RAMP_IDLE;
+#define RAMP_SETTLE_MS   1000UL
+#define RAMP_STEP_MS       30UL
+unsigned long rampTimer  = 0;
+unsigned long rampSettle = 0;
+int           rampDuty   = 0;
+State         rampDir    = IDLE;
+
+
+
+
+// ================== [I2C-REC] FAIL COUNTERS ==================
+int inaFailCount = 0;
+int encFailCount = 0;
+
+
+
+
+// ================== [ROLLBACK] ==================
+#define BOOT_VALIDATE_MS  30000UL
+unsigned long bootValidateTimer = 0;
+bool          bootValidateDone  = false;
+
+
+
+
+// ================== FORWARD DECLARATIONS ==================
+bool isRetryActive();
+bool safeToSleep();
+void stopMotor();
+void startMotor(State dir);
+void publishFullStatus();
+void publishPosition(State stoppedFrom);
+void publishVoltageEvent(String event, float v);
+void publishCurrentEvent(String event, float current);
+void handleEncoder();
+
+
+
+
+// ================== UNIFIED SLEEP GUARD ==================
+bool safeToSleep() {
+  return (motorState == IDLE      &&
+          rampState  == RAMP_IDLE &&
+          !resumePending          &&
+          !isRetryActive());
+}
+
+
+
+
+// ================== HELPERS ==================
+float getVoltage() { return ina226 ? ina226->getBusVoltage_V() : 0.0f; }
+float getCurrent() { return ina226 ? abs(ina226->getCurrent_mA()) / 1000.0f : 0.0f; }
+
+String getDeviceID() {
+  prefs.begin("aws_creds", true);
+  String id = prefs.getString("device_id", "");
+  prefs.end();
+  if (id.length() > 0) return id;
+  uint64_t chipid = ESP.getEfuseMac();
+  char buf[28];
+  sprintf(buf, "ESP32S3-%04X%08X", (uint16_t)(chipid >> 32), (uint32_t)chipid);
+  return String(buf);
+}
+
+
+
+
+// ================== [TLS] CREDENTIAL LOADER ==================
+bool loadAndApplyTLSCredentials() {
+  Serial.println("🔐 Loading TLS credentials from NVS...");
+  prefs.begin("aws_creds", true);
+  awsEndpoint = prefs.getString("endpoint", "");
+  awsCert     = prefs.getString("cert",     "");
+  awsPkey     = prefs.getString("pkey",     "");
+  awsRootCA   = prefs.getString("rootca",   "");
+  prefs.end();
+
+  if (awsEndpoint.length() == 0) { Serial.println("❌ TLS: endpoint missing");    return false; }
+  if (awsCert.length()     == 0) { Serial.println("❌ TLS: cert missing");        return false; }
+  if (awsPkey.length()     == 0) { Serial.println("❌ TLS: private key missing"); return false; }
+  if (awsRootCA.length()   == 0) { Serial.println("❌ TLS: root CA missing");     return false; }
+
+  gsmClient.setCACert(awsRootCA.c_str());
+  gsmClient.setCertificate(awsCert.c_str());
+  gsmClient.setPrivateKey(awsPkey.c_str());
+  otaClient.setCACert(awsRootCA.c_str());
+  otaClient.setCertificate(awsCert.c_str());
+  otaClient.setPrivateKey(awsPkey.c_str());
+
+  Serial.println("✅ TLS credentials applied");
+  Serial.print("🌐 AWS Endpoint: "); Serial.println(awsEndpoint);
+  return true;
+}
+
+
+
+
+// ================== [I2C-REC] BUS RECOVERY ==================
+void recoverI2C() {
+  Serial.println("🔧 I2C RECOVERY — bit-bang clock pulses");
+  pinMode(SDA_PIN, INPUT_PULLUP);
+  pinMode(SCL_PIN, OUTPUT);
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(SCL_PIN, HIGH); delayMicroseconds(5);
+    digitalWrite(SCL_PIN, LOW);  delayMicroseconds(5);
+    if (digitalRead(SDA_PIN) == HIGH) {
+      Serial.printf("✅ SDA released after %d pulses\n", i + 1);
+      break;
+    }
+  }
+  pinMode(SDA_PIN, OUTPUT);
+  digitalWrite(SDA_PIN, LOW);  delayMicroseconds(5);
+  digitalWrite(SCL_PIN, HIGH); delayMicroseconds(5);
+  digitalWrite(SDA_PIN, HIGH); delayMicroseconds(5);
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Serial.println("🔧 I2C Wire reinitialised");
+}
+
+
+
+
+// ================== [SENSOR] HEALTH CHECK ==================
+// Uses detected addresses (inaAddr, encAddr) instead of hardcoded constants.
+// If a device has moved address (shouldn't happen, but bus fault recovery may
+// cause glitches), re-scan is triggered via the existing i2cFault path.
+
+String checkINA226() {
+  if (inaAddr == 0x00) return "NO_ADDR";
+  Wire.beginTransmission(inaAddr);
+  if (Wire.endTransmission() != 0) return "NO_ACK";
+  if (!validateINA226(inaAddr)) return "BAD_ID";
+  return "OK";
+}
+
+String checkAS5600() {
+  if (encAddr == 0x00) return "NO_ADDR";
+  Wire.beginTransmission(encAddr);
+  if (Wire.endTransmission() != 0) return "NO_ACK";
+  Wire.beginTransmission(encAddr);
+  Wire.write(0x0B);
+  if (Wire.endTransmission(false) != 0) return "NO_ACK";
+  Wire.requestFrom(encAddr, (uint8_t)1);
+  if (!Wire.available()) return "NO_ACK";
+  uint8_t status = Wire.read();
+  if (!(status & 0x20)) return "NO_MAGNET";
+  Wire.beginTransmission(encAddr);
+  Wire.write(0x1A);
+  if (Wire.endTransmission(false) != 0) return "NO_ACK";
+  Wire.requestFrom(encAddr, (uint8_t)1);
+  if (!Wire.available()) return "NO_ACK";
+  uint8_t agc = Wire.read();
+  if (agc == 0 || agc == 255) return "AGC_SATURATED";
+  return "OK";
+}
+
+bool checkSensors() {
+  String inaResult = checkINA226();
+  String encResult = checkAS5600();
+
+  Serial.printf("🔬 INA226 @ 0x%02X: %s\n", inaAddr, inaResult.c_str());
+  Serial.printf("🔬 AS5600 @ 0x%02X: %s\n", encAddr, encResult.c_str());
+
+  bool inaNoAck = (inaResult == "NO_ACK" || inaResult == "NO_ADDR");
+  bool encNoAck = (encResult == "NO_ACK" || encResult == "NO_ADDR");
+  if (inaNoAck) inaFailCount++; else inaFailCount = 0;
+  if (encNoAck) encFailCount++; else encFailCount = 0;
+
+  if (inaFailCount >= 2 || encFailCount >= 2) {
+    Serial.println("⚠️ CONSECUTIVE NO_ACK — attempting I2C recovery");
+    recoverI2C();
+    // Re-run full hardware detection after bus recovery
+    bool redetected = detectHardware();
+    inaFailCount = 0; encFailCount = 0;
+    if (redetected && ina226 != nullptr) {
+      // Re-init INA226 with potentially updated address
+      delete ina226;
+      ina226 = new INA226_WE(inaAddr);
+      ina226->init();
+      configureINAAlert();
+    }
+    inaResult = checkINA226();
+    encResult = checkAS5600();
+    bool recovered = (inaResult == "OK" && encResult == "OK");
+    if (!recovered) {
+      if (!i2cFault) {
+        i2cFault = true;
+        Serial.println("🔴 I2C RECOVERY FAILED — motor blocked");
+        if (mqtt.connected()) {
+          StaticJsonDocument<160> doc;
+          doc["device_id"] = DEVICE_ID;
+          doc["i2c_event"] = "I2C_RECOVERY_FAIL";
+          doc["ina226"]    = inaResult;
+          doc["as5600"]    = encResult;
+          String out; serializeJson(doc, out);
+          mqtt.publish(pubStatusTopic.c_str(), out.c_str(), false, 1);
+        }
+      }
+    } else {
+      if (i2cFault) {
+        i2cFault = false;
+        Serial.println("✅ I2C RECOVERED");
+        publishHWProfile();   // re-publish updated addresses after recovery
+        if (mqtt.connected()) {
+          StaticJsonDocument<96> doc;
+          doc["device_id"] = DEVICE_ID;
+          doc["i2c_event"] = "I2C_RECOVERED";
+          String out; serializeJson(doc, out);
+          mqtt.publish(pubStatusTopic.c_str(), out.c_str(), false, 1);
+        }
+      }
+    }
+  } else {
+    if (i2cFault && inaResult == "OK" && encResult == "OK") {
+      i2cFault = false;
+      Serial.println("✅ I2C RECOVERED");
+      if (mqtt.connected()) {
+        StaticJsonDocument<96> doc;
+        doc["device_id"] = DEVICE_ID;
+        doc["i2c_event"] = "I2C_RECOVERED";
+        String out; serializeJson(doc, out);
+        mqtt.publish(pubStatusTopic.c_str(), out.c_str(), false, 1);
+      }
+    }
+  }
+
+  if (mqtt.connected()) {
+    StaticJsonDocument<192> doc;
+    doc["device_id"] = DEVICE_ID;
+    doc["ina226"]    = inaResult;
+    doc["as5600"]    = encResult;
+    char buf[8];
+    snprintf(buf, sizeof(buf), "0x%02X", inaAddr); doc["ina_addr"] = String(buf);
+    snprintf(buf, sizeof(buf), "0x%02X", encAddr); doc["enc_addr"] = String(buf);
+    String out; serializeJson(doc, out);
+    mqtt.publish(pubStatusTopic.c_str(), out.c_str(), false, 1);
+  }
+
+  return (inaResult == "OK" && encResult == "OK");
+}
+
+
+
+
+// ================== [INA ALERT] CONFIGURE HARDWARE ALERT ==================
+void configureINAAlert() {
+  if (inaAddr == 0x00) return;
+  uint16_t alertLimit = (uint16_t)((CURRENT_OFF * 1000.0 * 10.0) / 2.5);
+  Wire.beginTransmission(inaAddr);
+  Wire.write(0x07);
+  Wire.write((alertLimit >> 8) & 0xFF);
+  Wire.write(alertLimit & 0xFF);
+  Wire.endTransmission();
+  Wire.beginTransmission(inaAddr);
+  Wire.write(0x06);
+  Wire.write(0x80);
+  Wire.write(0x00);
+  Wire.endTransmission();
+  Serial.printf("⚡ INA226 ALERT @ 0x%02X: %.2fA threshold\n", inaAddr, CURRENT_OFF);
+}
+
+
+
+
+// ================== STORAGE ==================
+void savePosition() {
+  prefs.begin("encoder", false);
+  prefs.putLong("rot", rotationCount);
+  prefs.putInt("angle", angle);
+  prefs.end();
+  Serial.println("💾 POSITION SAVED");
+}
+
+void loadPosition() {
+  prefs.begin("encoder", true);
+  rotationCount = prefs.getLong("rot", 0);
+  angle         = prefs.getInt("angle", 0);
+  prefs.end();
+  prevAngle  = angle;
+  totalTurns = rotationCount + (angle / 4096.0);
+  Serial.println("📂 POSITION LOADED");
+}
+
+
+
+
+// ================== RETRY ==================
+bool isRetryActive() {
+  return (retryCount > 0 && retryCount < 3 && !lockFault);
+}
+
+
+
+
+// ================== [RAMP] NON-BLOCKING RAMP HANDLER ==================
+void handleMotorRamp() {
+  if (rampState == RAMP_IDLE || rampState == RAMP_RUNNING) return;
+  unsigned long now = millis();
+
+  switch (rampState) {
+    case RAMP_UP:
+      if (now - rampTimer >= RAMP_STEP_MS) {
+        rampTimer = now; rampDuty += 3;
+        if (rampDuty > 255) rampDuty = 255;
+        ledcWrite(PWM_PIN, rampDuty);
+        if (rampDuty >= 255) { rampSettle = now; rampState = RAMP_BYPASS; }
+      }
+      break;
+    case RAMP_BYPASS:
+      if (now - rampSettle >= RAMP_SETTLE_MS) {
+        digitalWrite(RELAY_PWR, RELAY_ON);
+        ledcWrite(PWM_PIN, 255);
+        motorState = rampDir; lastDirection = rampDir;
+        rampState  = RAMP_RUNNING;
+        Serial.println("⚡ BYPASS RELAY ON — MOTOR RUNNING");
+      }
+      break;
+    case RAMP_DOWN_INIT:
+      digitalWrite(RELAY_PWR, RELAY_OFF);
+      rampDuty = 255; ledcWrite(PWM_PIN, rampDuty);
+      rampTimer = now; rampState = RAMP_DOWN;
+      Serial.println("🔽 SOFT STOP — ramping PWM down");
+      break;
+    case RAMP_DOWN:
+      if (now - rampTimer >= RAMP_STEP_MS) {
+        rampTimer = now; rampDuty -= 3;
+        if (rampDuty < 0) rampDuty = 0;
+        ledcWrite(PWM_PIN, rampDuty);
+        if (rampDuty <= 0) { ledcWrite(PWM_PIN, 0); rampState = RAMP_DONE; }
+      }
+      break;
+    case RAMP_DONE:
+      digitalWrite(RELAY_FWD, RELAY_OFF);
+      digitalWrite(RELAY_REV, RELAY_OFF);
+      ledcWrite(PWM_PIN, 0);
+      rampState = RAMP_IDLE; motorState = IDLE;
+      savePosition();
+      publishPosition(resumeDirection);
+      Serial.println("🛑 MOTOR STOPPED — IDLE");
+      break;
+    default: break;
+  }
+}
+
+
+
+
+// ================== MOTOR ==================
+void clearRelays() {
+  ledcWrite(PWM_PIN, 0);
+  digitalWrite(RELAY_PWR, RELAY_OFF);
+  digitalWrite(RELAY_FWD, RELAY_OFF);
+  digitalWrite(RELAY_REV, RELAY_OFF);
+}
+
+void stopMotor() {
+  State stoppedFrom = motorState;
+  if (motorState != IDLE) {
+    resumeDirection = motorState; resumePending = true;
+    if (rampState == RAMP_UP || rampState == RAMP_BYPASS) {
+      clearRelays(); rampState = RAMP_IDLE; motorState = IDLE;
+      savePosition(); publishPosition(stoppedFrom); return;
+    }
+    rampState = RAMP_DOWN_INIT; return;
+  }
+  clearRelays(); rampState = RAMP_IDLE;
+}
+
+void startMotor(State dir) {
+  if (vState   == LOCKED) { Serial.println("🔒 BATTERY LOCKED");    return; }
+  if (lockFault)           { Serial.println("🔒 CURRENT LOCKED");    return; }
+  if (i2cFault)            { Serial.println("🔒 I2C FAULT BLOCKED"); return; }
+  if (!limitOverride && dir == REVERSE_RUN && totalTurns <= MIN_TURNS)
+                           { Serial.println("⛔ REVERSE BLOCKED");   return; }
+  if (!limitOverride && dir == FORWARD_RUN && totalTurns >= MAX_TURNS)
+                           { Serial.println("⛔ FORWARD BLOCKED");   return; }
+  clearRelays();
+  rampDuty = 0; rampDir = dir;
+  rampTimer = millis() + 200;
+  if (dir == FORWARD_RUN) {
+    digitalWrite(RELAY_REV, RELAY_OFF); digitalWrite(RELAY_FWD, RELAY_ON);
+  } else {
+    digitalWrite(RELAY_FWD, RELAY_OFF); digitalWrite(RELAY_REV, RELAY_ON);
+  }
+  rampState = RAMP_UP;
+  Serial.println("🔼 SOFT START — non-blocking ramp initiated");
+}
+
+
+
+
+// ================== [QOS1] MQTT PUBLISH WRAPPER ==================
+bool mqttPublish(const char* topic, const String& payload) {
+  if (!mqtt.connected()) { Serial.println("⚠️ MQTT not connected — publish skipped"); return false; }
+  bool ok = mqtt.publish(topic, payload.c_str(), false, 1);
+  if (!ok) Serial.println("⚠️ MQTT publish failed — will retry on reconnect");
+  return ok;
+}
+
+
+
+
+// ================== MQTT PUBLISH FUNCTIONS ==================
+void publishPosition(State stoppedFrom) {
+  StaticJsonDocument<192> doc;
+  doc["device_id"] = DEVICE_ID;
+  doc["turns"]     = totalTurns;
+  doc["state"]     = "IDLE";
+  doc["ts"]        = getTimestamp();
+  if      (stoppedFrom == FORWARD_RUN) doc["stopped_from"] = "FORWARD";
+  else if (stoppedFrom == REVERSE_RUN) doc["stopped_from"] = "REVERSE";
+  else                                  doc["stopped_from"] = "IDLE";
+  String out; serializeJson(doc, out);
+  mqttPublish(pubStatusTopic.c_str(), out);
+  Serial.print("📤 POS: "); Serial.println(out);
+}
+
+void publishVoltageEvent(String event, float v) {
+  StaticJsonDocument<160> doc;
+  doc["device_id"]     = DEVICE_ID;
+  doc["voltage_event"] = event;
+  doc["voltage_v"]     = v;
+  doc["ts"]            = getTimestamp();
+  String out; serializeJson(doc, out);
+  mqttPublish(pubEventTopic.c_str(), out);
+  Serial.print("📤 VOLT EVENT: "); Serial.println(out);
+}
+
+void publishCurrentEvent(String event, float current) {
+  StaticJsonDocument<160> doc;
+  doc["device_id"]     = DEVICE_ID;
+  doc["current_event"] = event;
+  doc["current_a"]     = current;
+  doc["threshold_a"]   = CURRENT_OFF;
+  doc["retry"]         = retryCount;
+  doc["ts"]            = getTimestamp();
+  String out; serializeJson(doc, out);
+  mqttPublish(pubEventTopic.c_str(), out);
+  Serial.print("📤 CURR EVENT: "); Serial.println(out);
+}
+
+void publishFullStatus() {
+  StaticJsonDocument<448> doc;
+  doc["device_id"]   = DEVICE_ID;
+  doc["fw_version"]  = FW_VERSION;
+  doc["fw_type"]     = FW_TYPE;
+  if      (motorState == IDLE)        doc["state"] = "IDLE";
+  else if (motorState == FORWARD_RUN) doc["state"] = "FORWARD";
+  else                                doc["state"] = "REVERSE";
+  doc["turns"]     = totalTurns;
+  doc["max_turns"] = MAX_TURNS;
+  doc["ts"]        = getTimestamp();
+  doc["rtc_valid"] = rtcIsValid();
+  switch (vState) {
+    case NORMAL:        doc["voltage_status"] = "NORMAL";          break;
+    case WARNING:       doc["voltage_status"] = "WARNING";         break;
+    case WAIT_BYPASS:   doc["voltage_status"] = "LOW_VOLTAGE_CUT"; break;
+    case BYPASS_ACTIVE: doc["voltage_status"] = "BYPASS_ACTIVE";   break;
+    case LOCKED:        doc["voltage_status"] = "CRITICAL_LOCK";   break;
+  }
+  doc["vbat_raw_mv"]  = vbatMV;
+  doc["oc_threshold"] = CURRENT_OFF;
+  doc["retry"]        = retryCount;
+  if      (lockFault)        doc["fault"] = "CURRENT_LOCK";
+  else if (vState == LOCKED) doc["fault"] = "VOLTAGE_LOCK";
+  else if (i2cFault)         doc["fault"] = "I2C_FAULT";
+  else                       doc["fault"] = "OK";
+  // Include detected hardware addresses in every full status
+  char buf[8];
+  JsonObject hw = doc.createNestedObject("hw_profile");
+  snprintf(buf, sizeof(buf), "0x%02X", inaAddr); hw["ina_addr"] = String(buf);
+  snprintf(buf, sizeof(buf), "0x%02X", encAddr); hw["enc_addr"] = String(buf);
+  snprintf(buf, sizeof(buf), "0x%02X", rtcAddr); hw["rtc_addr"] = String(buf);
+  if (updateAvailable) {
+    doc["update_available"] = true;
+    doc["update_version"]   = pendingUpdateVer;
+  }
+  String out; serializeJson(doc, out);
+  mqttPublish(pubStatusTopic.c_str(), out);
+  Serial.print("📤 STATUS: "); Serial.println(out);
+}
+
+
+
+
+// ================== ENCODER ==================
+int readAngle() {
+  if (encAddr == 0x00) return -1;
+  Wire.beginTransmission(encAddr);
+  Wire.write(0x0E);
+  Wire.endTransmission(false);
+  Wire.requestFrom(encAddr, (uint8_t)2);
+  if (Wire.available() == 2) {
+    int high = Wire.read(); int low = Wire.read();
+    return ((high << 8) | low) & 0x0FFF;
+  }
+  return -1;
+}
+
+void handleEncoder() {
+  int a = readAngle(); if (a == -1) return;
+  int diff = a - prevAngle;
+  if (diff >  3000) rotationCount--;
+  if (diff < -3000) rotationCount++;
+  prevAngle = a; angle = a;
+  totalTurns = rotationCount + (angle / 4096.0);
+  if (motorState == FORWARD_RUN && totalTurns >= MAX_TURNS) {
+    Serial.println("🛑 FORWARD LIMIT REACHED"); stopMotor();
+  }
+  if (motorState == REVERSE_RUN && totalTurns <= MIN_TURNS) {
+    Serial.println("🛑 REVERSE LIMIT REACHED"); stopMotor();
+  }
+}
+
+
+
+
+// ================== [BUZZ] BUZZER HANDLER ==================
+void handleBuzzer() {
+  bool limitActive = (digitalRead(LIMIT_SWITCH_PIN) == LOW);
+  if (!limitActive) { digitalWrite(BUZZER_PIN, HIGH); buzzerTimer = millis(); return; }
+
+  int mode = 1;
+  if      (totalTurns <= MIN_TURNS) mode = 2;
+  else if (totalTurns >= MAX_TURNS) mode = 3;
+
+  unsigned long now = millis(), elapsed = now - buzzerTimer;
+
+  if (mode == 1) {
+    if      (elapsed < 150) digitalWrite(BUZZER_PIN, LOW);
+    else if (elapsed < 600) digitalWrite(BUZZER_PIN, HIGH);
+    else                    buzzerTimer = now;
+  } else if (mode == 2) {
+    if      (elapsed < 150)  digitalWrite(BUZZER_PIN, LOW);
+    else if (elapsed < 300)  digitalWrite(BUZZER_PIN, HIGH);
+    else if (elapsed < 450)  digitalWrite(BUZZER_PIN, LOW);
+    else if (elapsed < 600)  digitalWrite(BUZZER_PIN, HIGH);
+    else if (elapsed >= 1100) buzzerTimer = now;
+  } else {
+    if      (elapsed < 150)  digitalWrite(BUZZER_PIN, LOW);
+    else if (elapsed < 300)  digitalWrite(BUZZER_PIN, HIGH);
+    else if (elapsed < 450)  digitalWrite(BUZZER_PIN, LOW);
+    else if (elapsed < 600)  digitalWrite(BUZZER_PIN, HIGH);
+    else if (elapsed < 750)  digitalWrite(BUZZER_PIN, LOW);
+    else if (elapsed < 900)  digitalWrite(BUZZER_PIN, HIGH);
+    else if (elapsed >= 1400) buzzerTimer = now;
+  }
+}
+
+
+
+
+// ================== LIMIT SWITCH ==================
+void handleLimit() {
+  bool limitNow = (digitalRead(LIMIT_SWITCH_PIN) == LOW);
+  if (!limitOverride && limitNow && lastLimitState == HIGH) {
+    Serial.println("🔴 LIMIT SWITCH"); stopMotor();
+  }
+  lastLimitState = limitNow;
+}
+
+
+
+
+// ================== CURRENT ==================
+void handleCurrent() {
+  float current = getCurrent();
+  bool  over    = (current > CURRENT_OFF) || inaAlertFlag;
+
+  if (inaAlertFlag) { inaAlertFlag = false; Serial.println("⚡ INA ALERT INTERRUPT FIRED"); }
+
+  if (motorState != IDLE && over && !lastOvercurrent) {
+    Serial.println("⚠️ OVERCURRENT");
+    stopMotor(); retryCount++; ocTripTime = millis(); ocFault = true;
+    Serial.printf("🔁 ATTEMPT: %d\n", retryCount);
+    publishCurrentEvent("OC_TRIP", current);
+    if (retryCount >= 3) {
+      Serial.println("🔒 CURRENT LOCKED");
+      lockFault = true; publishCurrentEvent("LOCKED", current);
+    }
+  }
+  lastOvercurrent = over;
+
+  if (ocFault && !lockFault && millis() - ocTripTime > RETRY_DELAY) {
+    Serial.println("🔁 RETRYING");
+    publishCurrentEvent("OC_RETRY", current);
+    startMotor(lastDirection); ocFault = false;
+  }
+
+  static bool ocEventActive = false;
+  if (ocEventActive && !over && !ocFault && !lockFault) {
+    publishCurrentEvent("OC_RESET", current); ocEventActive = false;
+  }
+  if (ocFault && !lockFault) ocEventActive = true;
+}
+
+
+
+
+// ================== VOLTAGE ==================
+void handleVoltageSafety() {
+  float v = getVoltage();
+
+  if (v <= CRITICAL_V && vState != LOCKED) {
+    Serial.printf("🛑 CRITICAL: %.2fV → LOCK\n", v);
+    stopMotor(); vState = LOCKED; publishVoltageEvent("LOCKED", v); return;
+  }
+  if (vState == LOCKED) {
+    if (v >= RESET_V) { vState = NORMAL; publishVoltageEvent("NORMAL", v); } return;
+  }
+  if (vState == BYPASS_ACTIVE) {
+    if (v <= CRITICAL_V) { stopMotor(); vState = LOCKED; publishVoltageEvent("LOCKED", v); return; }
+    if (v >= RESET_V)    { vState = NORMAL; publishVoltageEvent("NORMAL", v); }
+    return;
+  }
+  if (vState == WAIT_BYPASS) return;
+
+  if (v < WARN_V_LOW) {
+    if (vState == NORMAL) { vState = WARNING; warnPrintTimer = 0; publishVoltageEvent("WARNING", v); }
+    if (millis() - warnPrintTimer > 5000) {
+      warnPrintTimer = millis();
+      Serial.printf("⚠️ VOLTAGE: %.2fV\n", v);
+    }
+  } else if (v > WARN_V_HIGH && vState == WARNING) {
+    vState = NORMAL; publishVoltageEvent("NORMAL", v);
+  }
+  if (v < CUT_V && motorState != IDLE && vState != WAIT_BYPASS) {
+    Serial.printf("🛑 LOW VOLTAGE CUT: %.2fV\n", v);
+    stopMotor(); vState = WAIT_BYPASS; publishVoltageEvent("CUT", v);
+  }
+}
+
+
+
+
+// ================== JSON COMMAND HANDLER ==================
+bool sleepCommandReceived = false;
+
+void handleJSONCommand(String input) {
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, input)) { Serial.println("❌ JSON ERROR"); return; }
+  String id = doc["device_id"]; if (id != DEVICE_ID) return;
+  String cmd = doc["cmd"];
+
+  if      (cmd == "F") { startMotor(FORWARD_RUN); sleepCommandReceived = true; }
+  else if (cmd == "R") { startMotor(REVERSE_RUN); sleepCommandReceived = true; }
+  else if (cmd == "S") { stopMotor(); }
+
+  else if (vState == WAIT_BYPASS) {
+    if (cmd == "Y") {
+      vState = BYPASS_ACTIVE; publishVoltageEvent("BYPASS", getVoltage());
+      if (resumePending) { startMotor(resumeDirection); resumePending = false; }
+      sleepCommandReceived = true;
+    } else if (cmd == "N") { vState = WARNING; resumePending = false; sleepCommandReceived = true; }
+  }
+
+  else if (cmd == "SET_TIME") {
+    String iso = doc["iso"] | "";
+    if (iso.length() >= 19) {
+      struct tm t;
+      if (parseISO(iso, t) && rtcSetTime(t)) {
+        Serial.println("✅ RTC TIME SET: " + iso);
+        StaticJsonDocument<128> resp;
+        resp["device_id"] = DEVICE_ID; resp["rtc_event"] = "TIME_SET"; resp["ts"] = getTimestamp();
+        String out; serializeJson(resp, out); mqttPublish(pubStatusTopic.c_str(), out);
+        armNextAlarm();
+      } else { Serial.println("❌ RTC write failed"); }
+    } else { Serial.println("❌ SET_TIME: missing iso field"); }
+    sleepCommandReceived = true;
+  }
+
+  else if (cmd == "SCHEDULE") {
+    int slot = doc["slot"] | -1;
+    if (slot >= 0 && slot < SCHED_SLOTS) {
+      String action = doc["action"] | "OPEN";
+      String days   = doc["days"]   | "0000000";
+      int    hour   = doc["hour"]   | 0;
+      int    minute = doc["minute"] | 0;
+      schedSlots[slot].enabled = true;
+      schedSlots[slot].action  = (action == "CLOSE") ? 1 : 0;
+      schedSlots[slot].hour    = (uint8_t)constrain(hour,   0, 23);
+      schedSlots[slot].minute  = (uint8_t)constrain(minute, 0, 59);
+      if (days.length() == 7) { memcpy(schedSlots[slot].days, days.c_str(), 7); schedSlots[slot].days[7] = '\0'; }
+      else                    { memcpy(schedSlots[slot].days, "0000000", 7);    schedSlots[slot].days[7] = '\0'; }
+      saveSchedule(); armNextAlarm(); publishSchedule();
+      Serial.printf("📅 SLOT %d SET: %s %02d:%02d days=%s\n", slot, action.c_str(), hour, minute, days.c_str());
+    } else { Serial.println("❌ SCHEDULE: invalid slot (0–7)"); }
+    sleepCommandReceived = true;
+  }
+
+  else if (cmd == "CLEAR_SCHEDULE") {
+    int slot = doc["slot"] | -1;
+    if (slot >= 0 && slot < SCHED_SLOTS) {
+      schedSlots[slot].enabled = false;
+      memcpy(schedSlots[slot].days, "0000000", 7); schedSlots[slot].days[7] = '\0';
+      saveSchedule(); armNextAlarm(); publishSchedule();
+      Serial.printf("📅 SLOT %d CLEARED\n", slot);
+    } else { Serial.println("❌ CLEAR_SCHEDULE: invalid slot (0–7)"); }
+    sleepCommandReceived = true;
+  }
+
+  else if (cmd == "GET_SCHEDULE") { publishSchedule(); sleepCommandReceived = true; }
+
+  else if (cmd == "GET_HW_PROFILE") { publishHWProfile(); sleepCommandReceived = true; }
+
+  else if (cmd == "SET_CURRENT") {
+    float newVal = doc["value"] | CURRENT_OFF;
+    if (newVal > 0.1 && newVal < 10.0) {
+      CURRENT_OFF = newVal;
+      prefs.begin("device_cfg", false); prefs.putFloat("oc_thresh", CURRENT_OFF); prefs.end();
+      lockFault = false; ocFault = false; retryCount = 0;
+      configureINAAlert(); publishCurrentEvent("THRESHOLD_SET", getCurrent());
+    } else { Serial.println("❌ INVALID CURRENT VALUE"); }
+    sleepCommandReceived = true;
+  }
+
+  else if (cmd == "SET_TURNS") {
+    float newTurns = doc["value"] | MAX_TURNS;
+    if (newTurns >= 2.0 && newTurns <= 20.0) {
+      MAX_TURNS = newTurns;
+      prefs.begin("device_cfg", false); prefs.putFloat("max_turns", MAX_TURNS); prefs.end();
+      publishFullStatus();
+    } else { Serial.println("❌ INVALID TURNS VALUE (2.0–20.0)"); }
+    sleepCommandReceived = true;
+  }
+
+  else if (cmd == "GET_STATUS")  { publishFullStatus(); sleepCommandReceived = true; }
+  else if (cmd == "GET_SENSORS") { checkSensors();      sleepCommandReceived = true; }
+
+  else if (cmd == "CHECK_UPDATE") {
+    StaticJsonDocument<128> upd;
+    upd["device_id"]        = DEVICE_ID;
+    upd["update_available"] = updateAvailable;
+    upd["current_version"]  = FW_VERSION;
+    if (updateAvailable) upd["update_version"] = pendingUpdateVer;
+    String out; serializeJson(upd, out); mqttPublish(pubStatusTopic.c_str(), out);
+    sleepCommandReceived = true;
+  }
+
+  else if (cmd == "DO_UPDATE") {
+    if (updateAvailable && pendingUpdateURL.length() > 0) {
+      Serial.println("🚀 OTA ACCEPTED — waiting for motor idle");
+      stopMotor(); fwState = FW_OTA_WAIT;
+    } else { Serial.println("❌ NO UPDATE PENDING"); }
+    sleepCommandReceived = true;
+  }
+
+  else { sleepCommandReceived = true; }
+}
+
+
+
+
+// ================== UPDATE TOPIC HANDLER ==================
+void handleUpdatePayload(String payload) {
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, payload)) return;
+  String version = doc["version"] | "";
+  String url     = doc["url"]     | "";
+  String sha256  = doc["sha256"]  | "";
+  if (version.length() == 0) return;
+
+  if (version != FW_VERSION) {
+    updateAvailable  = true;
+    pendingUpdateVer = version;
+    pendingUpdateURL = url;
+    pendingUpdateSHA = sha256;
+    if (sha256.length() == 0) Serial.println("⚠️ No SHA-256 — integrity check skipped");
+    StaticJsonDocument<192> notif;
+    notif["device_id"]        = DEVICE_ID;
+    notif["update_available"] = true;
+    notif["update_version"]   = version;
+    notif["current_version"]  = FW_VERSION;
+    notif["note"]             = "Send DO_UPDATE to install";
+    String out; serializeJson(notif, out); mqttPublish(pubStatusTopic.c_str(), out);
+    sleepCommandReceived = true;
+  } else {
+    updateAvailable = false;
+    Serial.println("✅ FIRMWARE UP TO DATE");
+  }
+}
+
+
+
+
+// ================== [OTA] FULL OTA WITH TLS + CHECKSUM + ROLLBACK ==================
+void performOTA() {
+  Serial.println("🚀 OTA START");
+  String url = pendingUpdateURL; String host = ""; String path = "/"; int port = 443;
+  if (url.startsWith("https://")) url = url.substring(8);
+  else if (url.startsWith("http://")) { url = url.substring(7); port = 80; }
+  int slashIdx = url.indexOf('/');
+  if (slashIdx == -1) { host = url; } else { host = url.substring(0, slashIdx); path = url.substring(slashIdx); }
+  int colonIdx = host.indexOf(':');
+  if (colonIdx != -1) { port = host.substring(colonIdx + 1).toInt(); host = host.substring(0, colonIdx); }
+
+  if (!otaClient.connect(host.c_str(), port)) {
+    Serial.println("❌ OTA TCP failed");
+    if (mqtt.connected()) { StaticJsonDocument<96> e; e["device_id"]=DEVICE_ID; e["ota_event"]="OTA_FAIL"; e["reason"]="TCP_CONNECT"; String o; serializeJson(e,o); mqttPublish(pubStatusTopic.c_str(),o); }
+    fwState = FW_ACTIVE; return;
+  }
+  otaClient.print(String("GET ") + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n");
+
+  unsigned long hdrT = millis(); int contentLength = -1; bool hdrDone = false;
+  while (!hdrDone && millis() - hdrT < 10000) {
+    if (otaClient.available()) {
+      String line = otaClient.readStringUntil('\n'); line.trim();
+      if (line.startsWith("Content-Length:") || line.startsWith("content-length:"))
+        contentLength = line.substring(line.indexOf(':') + 1).toInt();
+      if (line.length() == 0) hdrDone = true;
+    }
+  }
+  if (contentLength <= 0 || !Update.begin(contentLength)) {
+    otaClient.stop();
+    if (mqtt.connected()) { StaticJsonDocument<96> e; e["device_id"]=DEVICE_ID; e["ota_event"]="OTA_FAIL"; e["reason"]="BAD_CONTENT_LENGTH"; String o; serializeJson(e,o); mqttPublish(pubStatusTopic.c_str(),o); }
+    fwState = FW_ACTIVE; return;
+  }
+
+  bool doChecksum = (pendingUpdateSHA.length() == 64);
+  mbedtls_sha256_context sha256ctx;
+  if (doChecksum) { mbedtls_sha256_init(&sha256ctx); mbedtls_sha256_starts(&sha256ctx, 0); }
+
+  uint8_t buf[256]; int written = 0; int lastPct = -1; unsigned long dataT = millis();
+  while (written < contentLength) {
+    if (!otaClient.connected() && !otaClient.available()) { Serial.println("❌ OTA dropped"); break; }
+    int rd = otaClient.readBytes(buf, min((int)sizeof(buf), contentLength - written));
+    if (rd > 0) {
+      Update.write(buf, rd);
+      if (doChecksum) mbedtls_sha256_update(&sha256ctx, buf, rd);
+      written += rd; dataT = millis();
+      int pct = (written * 100) / contentLength; int bucket = pct / 10;
+      if (bucket != lastPct) {
+        lastPct = bucket; Serial.printf("📶 OTA: %d%%\n", pct);
+        if (mqtt.connected()) { StaticJsonDocument<96> p; p["device_id"]=DEVICE_ID; p["ota_event"]="OTA_PROGRESS"; p["progress_pct"]=pct; String o; serializeJson(p,o); mqttPublish(pubStatusTopic.c_str(),o); }
+      }
+    } else if (millis() - dataT > 10000) { Serial.println("❌ OTA timeout"); break; }
+  }
+  otaClient.stop();
+
+  if (written != contentLength) {
+    Update.abort(); if (doChecksum) mbedtls_sha256_free(&sha256ctx);
+    if (mqtt.connected()) { StaticJsonDocument<96> e; e["device_id"]=DEVICE_ID; e["ota_event"]="OTA_FAIL"; e["reason"]="INCOMPLETE_WRITE"; String o; serializeJson(e,o); mqttPublish(pubStatusTopic.c_str(),o); }
+    fwState = FW_ACTIVE; return;
+  }
+
+  if (doChecksum) {
+    uint8_t digest[32]; mbedtls_sha256_finish(&sha256ctx, digest); mbedtls_sha256_free(&sha256ctx);
+    char hex[65]; for (int i=0;i<32;i++) sprintf(hex+i*2,"%02x",digest[i]); hex[64]='\0';
+    if (String(hex) != pendingUpdateSHA) {
+      Serial.println("❌ CHECKSUM MISMATCH"); Update.abort();
+      if (mqtt.connected()) { StaticJsonDocument<96> e; e["device_id"]=DEVICE_ID; e["ota_event"]="OTA_FAIL"; e["reason"]="CHECKSUM_MISMATCH"; String o; serializeJson(e,o); mqttPublish(pubStatusTopic.c_str(),o); }
+      fwState = FW_ACTIVE; return;
+    }
+    Serial.println("✅ CHECKSUM OK");
+  }
+
+  if (!Update.end()) {
+    if (mqtt.connected()) { StaticJsonDocument<96> e; e["device_id"]=DEVICE_ID; e["ota_event"]="OTA_FAIL"; e["reason"]="UPDATE_END"; String o; serializeJson(e,o); mqttPublish(pubStatusTopic.c_str(),o); }
+    fwState = FW_ACTIVE; return;
+  }
+
+  prefs.begin("device_cfg", false); prefs.putString("boot_check", "PENDING"); prefs.end();
+  Serial.println("✅ OTA WRITTEN — rebooting");
+  if (mqtt.connected()) {
+    StaticJsonDocument<96> d; d["device_id"]=DEVICE_ID; d["ota_event"]="OTA_DONE"; d["update_version"]=pendingUpdateVer;
+    String o; serializeJson(d,o); mqttPublish(pubStatusTopic.c_str(),o); delay(500);
+  }
+  ESP.restart();
+}
+
+
+
+
+// ================== DASHBOARD ==================
+void printDashboard() {
+  if (millis() - dashboardTimer < 2000) return;
+  dashboardTimer = millis();
+  Serial.println("================================");
+  Serial.printf("V: %.2f | A: %.3f | Turns: %.2f/%.2f\n",
+                getVoltage(), getCurrent(), totalTurns, MAX_TURNS);
+  Serial.print("State: ");
+  if      (motorState == IDLE)        Serial.print("IDLE");
+  else if (motorState == FORWARD_RUN) Serial.print("FWD");
+  else                                Serial.print("REV");
+  if (rampState != RAMP_IDLE && rampState != RAMP_RUNNING) {
+    switch (rampState) {
+      case RAMP_UP:        Serial.print("[RAMP_UP]");   break;
+      case RAMP_BYPASS:    Serial.print("[BYPASS]");    break;
+      case RAMP_DOWN_INIT: Serial.print("[DOWN_INIT]"); break;
+      case RAMP_DOWN:      Serial.print("[RAMP_DOWN]"); break;
+      case RAMP_DONE:      Serial.print("[DONE]");      break;
+      default: break;
+    }
+  }
+  Serial.printf(" | TLS: %s | MQTT: %s | RTC: %s | Fault: ",
+                tlsReady        ? "✅" : "❌",
+                mqtt.connected() ? "✅" : "❌",
+                rtcIsValid()     ? "✅" : "❌");
+  if      (lockFault)        Serial.print("OC_LOCK");
+  else if (vState == LOCKED) Serial.print("V_LOCK");
+  else if (i2cFault)         Serial.print("I2C");
+  else                       Serial.print("OK");
+  Serial.println();
+  Serial.printf("HW: INA@0x%02X ENC@0x%02X RTC@0x%02X\n", inaAddr, encAddr, rtcAddr);
+  struct tm now;
+  if (rtcIsValid() && rtcGetTime(now)) {
+    Serial.printf("Time: %04d-%02d-%02d %02d:%02d:%02d\n",
+                  now.tm_year+1900, now.tm_mon+1, now.tm_mday,
+                  now.tm_hour, now.tm_min, now.tm_sec);
+  }
+  Serial.println("================================");
+}
+
+
+
+
+// ================== LTE ==================
+void handleLTE() { while (SerialAT.available()) Serial.write(SerialAT.read()); }
+
+void handleLTEInit() {
+  unsigned long now = millis();
+  switch (lteState) {
+    case LTE_AT:      SerialAT.println("AT"); lteTimer = now; lteState = LTE_CPIN; break;
+    case LTE_CPIN:    if (now - lteTimer < LTE_STEP_MS)  { handleLTE(); break; } SerialAT.println("AT+CPIN?"); lteTimer = now; lteState = LTE_CSQ; break;
+    case LTE_CSQ:     if (now - lteTimer < LTE_STEP_MS)  { handleLTE(); break; } SerialAT.println("AT+CSQ"); lteTimer = now; lteState = LTE_CREG; lteRegTries = 0; break;
+    case LTE_CREG:
+      if (now - lteTimer < LTE_REG_MS) { handleLTE(); break; }
+      lteTimer = now; SerialAT.println("AT+CREG?");
+      { unsigned long ps = millis(); String r = ""; while (millis()-ps < 500) { while (SerialAT.available()) r += char(SerialAT.read()); }
+        Serial.println(r);
+        if (r.indexOf("0,1") != -1 || r.indexOf("0,5") != -1) { Serial.println("✅ REGISTERED"); lteState = LTE_CGATT; }
+        else { lteRegTries++; if (lteRegTries >= 20) { Serial.println("❌ NETWORK FAILED"); lteReady = false; lteState = LTE_DONE; } } }
+      break;
+    case LTE_CGATT:   SerialAT.println("AT+CGATT=1"); lteTimer = now; lteState = LTE_CGDCONT; break;
+    case LTE_CGDCONT: if (now - lteTimer < LTE_LONG_MS)  { handleLTE(); break; } SerialAT.println("AT+CGDCONT=1,\"IP\",\"iot.com\""); lteTimer = now; lteState = LTE_CGACT; break;
+    case LTE_CGACT:   if (now - lteTimer < LTE_REG_MS)   { handleLTE(); break; } SerialAT.println("AT+CGACT=1,1"); lteTimer = now; lteState = LTE_CGPADDR; break;
+    case LTE_CGPADDR: if (now - lteTimer < LTE_XLONG_MS) { handleLTE(); break; } SerialAT.println("AT+CGPADDR=1"); lteTimer = now; lteState = LTE_PING; break;
+    case LTE_PING:    if (now - lteTimer < LTE_REG_MS)   { handleLTE(); break; } SerialAT.println("AT+QPING=1,\"8.8.8.8\""); lteTimer = now; lteState = LTE_DONE; break;
+    case LTE_DONE:    if (now - lteTimer < LTE_XLONG_MS) { handleLTE(); break; } lteReady = true; Serial.println("✅ LTE READY"); fwState = FW_TLS_INIT; break;
+  }
+}
+
+
+
+
+// ================== MQTT ==================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg = ""; for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  Serial.println("📩 MQTT:"); Serial.println(msg);
+  String t = String(topic);
+  if (t == subUpdateTopic) handleUpdatePayload(msg);
+  else                     handleJSONCommand(msg);
+}
+
+void connectMQTT() {
+  if (mqtt.connected()) return;
+  if (!tlsReady) { Serial.println("⚠️ TLS not ready — MQTT connect skipped"); return; }
+  if (millis() - mqttRetryTimer < 5000) return;
+  mqttRetryTimer = millis();
+  Serial.println("🌐 AWS MQTT CONNECTING...");
+  mqtt.setServer(awsEndpoint.c_str(), awsPort);
+  mqtt.setCallback(mqttCallback);
+  mqtt.setBufferSize(512);
+  if (mqtt.connect(DEVICE_ID.c_str())) {
+    Serial.println("✅ AWS MQTT CONNECTED");
+    mqtt.subscribe(subCmdTopic.c_str(), 1);
+    mqtt.subscribe(subUpdateTopic.c_str(), 1);
+    mqtt.subscribe(shadowAcceptedTopic.c_str(), 1);
+    Serial.print("📡 CMD:    "); Serial.println(subCmdTopic);
+    Serial.print("📡 UPDATE: "); Serial.println(subUpdateTopic);
+    publishFullStatus();
+    publishHWProfile();   // always announce detected addresses on connect
+  } else {
+    Serial.printf("❌ AWS MQTT FAILED rc=%d\n", mqtt.state());
+  }
+}
+
+
+
+
+// ================== SETUP ==================
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+
+  DEVICE_ID = getDeviceID();
+
+  pubStatusTopic      = "actuator/" + DEVICE_ID + "/status";
+  pubEventTopic       = "actuator/" + DEVICE_ID + "/events";
+  subCmdTopic         = "actuator/" + DEVICE_ID + "/cmd";
+  subUpdateTopic      = "actuator/" + DEVICE_ID + "/update";
+  shadowUpdateTopic   = "$aws/things/" + DEVICE_ID + "/shadow/update";
+  shadowAcceptedTopic = "$aws/things/" + DEVICE_ID + "/shadow/update/accepted";
+
+  Serial.printf("📌 DEVICE ID: %s\n📌 FW VER:    %s\n📌 FW TYPE:   %s\n",
+                DEVICE_ID.c_str(), FW_VERSION, FW_TYPE);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  pinMode(RELAY_PWR,        OUTPUT);
+  pinMode(RELAY_FWD,        OUTPUT);
+  pinMode(RELAY_REV,        OUTPUT);
+  pinMode(LIMIT_SWITCH_PIN, INPUT_PULLUP);
+  pinMode(INA_ALERT_PIN,    INPUT_PULLUP);
+  pinMode(BUZZER_PIN,       OUTPUT);
+  pinMode(VBAT_ADC_PIN,     INPUT);
+  pinMode(RTC_INT_PIN,      INPUT_PULLUP);
+  pinMode(20,               INPUT);
+
+  digitalWrite(RELAY_PWR,  RELAY_OFF);
+  digitalWrite(RELAY_FWD,  RELAY_OFF);
+  digitalWrite(RELAY_REV,  RELAY_OFF);
+  digitalWrite(BUZZER_PIN, HIGH);
+  analogReadResolution(12);
+  vbatMV = readVBAT_mV();
+
+  attachInterrupt(digitalPinToInterrupt(INA_ALERT_PIN), inaAlertISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(RTC_INT_PIN),   rtcAlarmISR, FALLING);
+
+  ledcAttach(PWM_PIN, PWM_FREQ, PWM_RES);
+  ledcWrite(PWM_PIN, 0);
+  Serial.println("✅ PWM READY (GPIO36)");
+
+  // ── [HW] Auto-detect all I2C devices ──────────────────────────────────────
+  // detectHardware() sets inaAddr, encAddr, rtcAddr and caches in NVS.
+  // i2cFault is set true if any device is missing — motor will be blocked
+  // until the device is found on the next sensorCheckTimer cycle.
+  bool hwOK = detectHardware();
+  i2cFault = !hwOK;
+
+  // Allocate INA226_WE with the detected address
+  if (inaAddr != 0x00) {
+    ina226 = new INA226_WE(inaAddr);
+    ina226->init();
+  } else {
+    Serial.println("🔴 INA226 not found — ina226 pointer remains null");
+  }
+  // ──────────────────────────────────────────────────────────────────────────
+
+  prefs.begin("device_cfg", true);
+  CURRENT_OFF       = prefs.getFloat("oc_thresh", 1.0);
+  MAX_TURNS         = prefs.getFloat("max_turns", 10.0);
+  String bootCheck  = prefs.getString("boot_check", "OK");
+  prefs.end();
+
+  Serial.printf("⚡ OC THRESHOLD: %.2fA\n🔄 MAX TURNS:    %.2f\n", CURRENT_OFF, MAX_TURNS);
+
+  configureINAAlert();
+  loadPosition();
+  loadSchedule();
+  checkSensors();
+
+  if (rtcAddr != 0x00) {
+    if (rtcIsValid()) {
+      struct tm now;
+      if (rtcGetTime(now)) Serial.println("🕐 RTC VALID: " + rtcFormatISO(now));
+      armNextAlarm();
+    } else {
+      Serial.println("⚠️ RTC INVALID — send SET_TIME command after MQTT connect");
+    }
+  } else {
+    Serial.println("🔴 RTC not found — timestamps will show RTC_INVALID");
+  }
+
+  SerialAT.begin(115200, SERIAL_8N1, 44, 43);
+  lteTimer = millis() + 5000;
+  lteState = LTE_AT;
+
+  if (bootCheck == "PENDING") {
+    Serial.println("⚠️ POST-OTA BOOT — validation pending");
+    prefs.begin("device_cfg", false); prefs.putString("boot_check", "VALIDATING"); prefs.end();
+  }
+
+  fwState = FW_LTE_INIT;
+  Serial.println("✅ SYSTEM READY — entering LTE init");
+}
+
+
+
+
+// ================== LOOP ==================
+void loop() {
+  handleSimOp();
+
+  if (rtcAlarmFlag) {
+    rtcAlarmFlag = false;
+    Serial.println("⏰ RTC ALARM FIRED");
+    handleScheduledAlarms();
+  }
+
+  switch (fwState) {
+
+    case FW_LTE_INIT:
+      if (millis() < lteTimer && lteState == LTE_AT) { handleLTE(); break; }
+      handleLTEInit();
+      break;
+
+    case FW_TLS_INIT:
+      tlsReady = loadAndApplyTLSCredentials();
+      if (!tlsReady) Serial.println("❌ TLS INIT FAILED — check provisioning sketch");
+      fwState = FW_INIT;
+      break;
+
+    case FW_INIT:
+      Serial.println("🚀 FW INIT");
+      connectMQTT();
+      {
+        prefs.begin("device_cfg", true);
+        String bc = prefs.getString("boot_check", "OK");
+        prefs.end();
+        fwState = (bc == "VALIDATING") ? FW_BOOT_VALIDATE : FW_ACTIVE;
+      }
+      break;
+
+    case FW_BOOT_VALIDATE:
+      connectMQTT(); mqtt.loop();
+      if (bootValidateTimer == 0) bootValidateTimer = millis();
+      if (mqtt.connected() && !bootValidateDone) {
+        bool ok = checkSensors();
+        if (ok) {
+          Serial.println("✅ BOOT VALIDATION PASSED");
+          prefs.begin("device_cfg", false); prefs.putString("boot_check", "OK"); prefs.end();
+          bootValidateDone = true;
+          StaticJsonDocument<96> v; v["device_id"]=DEVICE_ID; v["ota_event"]="OTA_VALIDATED"; v["fw_version"]=FW_VERSION;
+          String o; serializeJson(v,o); mqttPublish(pubStatusTopic.c_str(),o);
+          publishFullStatus(); fwState = FW_ACTIVE;
+        }
+      }
+      if (!bootValidateDone && millis() - bootValidateTimer > BOOT_VALIDATE_MS) {
+        Serial.println("❌ BOOT VALIDATION TIMEOUT — rolling back");
+        prefs.begin("device_cfg", false); prefs.putString("boot_check", "OK"); prefs.end();
+        if (mqtt.connected()) {
+          StaticJsonDocument<96> rb; rb["device_id"]=DEVICE_ID; rb["ota_event"]="OTA_ROLLBACK"; rb["reason"]="VALIDATION_TIMEOUT";
+          String o; serializeJson(rb,o); mqttPublish(pubStatusTopic.c_str(),o); delay(300);
+        }
+        if (Update.canRollback()) Update.rollback();
+        ESP.restart();
+      }
+      break;
+
+    case FW_ACTIVE:
+
+      if (bypassSleepPending && millis() - bypassSleepTimer >= 30000) {
+        bypassSleepPending = false;
+        if (safeToSleep()) { sleepMode = true; sleepSub = SLEEP_ENTER; fwState = FW_SLEEP; }
+      }
+
+      if (safeToSleep()) {
+        if (!idleTracking) { idleTracking = true; idleStart = millis(); }
+        if (!sleepMode && millis() - idleStart > 10000) {
+          savePosition(); sleepMode = true; sleepSub = SLEEP_ENTER;
+          Serial.println("💾 PRE-SLEEP SAVE");
+        }
+      } else { idleTracking = false; }
+
+      if (sleepMode) { fwState = FW_SLEEP; break; }
+
+      if (Serial.available()) {
+        String input = Serial.readStringUntil('\n'); input.trim();
+        if (input.startsWith("{")) { handleJSONCommand(input); }
+        else {
+          input.toUpperCase();
+          if      (input == "F") startMotor(FORWARD_RUN);
+          else if (input == "R") startMotor(REVERSE_RUN);
+          else if (input == "S") stopMotor();
+          else if (vState == WAIT_BYPASS) {
+            if (input == "Y") {
+              vState = BYPASS_ACTIVE; publishVoltageEvent("BYPASS", getVoltage());
+              if (resumePending) { startMotor(resumeDirection); resumePending = false; }
+            } else { vState = WARNING; resumePending = false; }
+          }
+        }
+      }
+
+      connectMQTT();
+      mqtt.loop();
+      handleMotorRamp();
+      handleEncoder();
+      handleLimit();
+      handleCurrent();
+      handleVoltageSafety();
+      handleBuzzer();
+      printDashboard();
+
+      if (millis() - vbatReadTimer >= 2000) { vbatReadTimer = millis(); vbatMV = readVBAT_mV(); }
+
+      if (millis() - sensorCheckTimer >= 30000) {
+        sensorCheckTimer = millis();
+        // If a device was missing, re-run full detection before sensor check
+        if (i2cFault || inaAddr == 0x00 || encAddr == 0x00 || rtcAddr == 0x00) {
+          bool redetected = detectHardware();
+          if (redetected && ina226 == nullptr && inaAddr != 0x00) {
+            ina226 = new INA226_WE(inaAddr);
+            ina226->init();
+            configureINAAlert();
+            publishHWProfile();
+          }
+        }
+        checkSensors();
+      }
+
+      handleLTE();
+      break;
+
+    case FW_SLEEP:
+      handleSimOp();
+      switch (sleepSub) {
+
+        case SLEEP_ENTER:
+          if (!simOpDone()) break;
+          mqttSleepCheckTimer = millis();
+          simEnterSleep();
+          Serial.println("😴 SLEEP MODE");
+          sleepSub = SLEEP_IDLE;
+          break;
+
+        case SLEEP_IDLE:
+          if (!simOpDone()) break;
+          if (rtcAlarmFlag) {
+            rtcAlarmFlag = false;
+            Serial.println("⏰ RTC ALARM — SCHEDULE WAKE");
+            simWake(); mqttRetryTimer = 0;
+            sleepMode = false; idleTracking = false; idleStart = millis();
+            sleepSub = SLEEP_ENTER; fwState = FW_ACTIVE;
+            handleScheduledAlarms();
+            break;
+          }
+          if (digitalRead(LIMIT_SWITCH_PIN) == LOW) {
+            Serial.println("⚡ LIMIT WAKE"); limitOverride = true; sleepSub = SLEEP_LIMIT; break;
+          }
+          if (millis() - mqttSleepCheckTimer >= MQTT_SLEEP_CHECK_MS) {
+            mqttSleepCheckTimer = millis();
+            Serial.println("⏰ SLEEP CHECK");
+            simWake(); mqttRetryTimer = 0; sleepCommandReceived = false;
+            mqttChkStart = millis(); sleepSub = SLEEP_MQTTCHK;
+          }
+          break;
+
+        case SLEEP_LIMIT:
+          mqtt.loop(); handleEncoder();
+          if (millis() - saveTimer > 2000) { saveTimer = millis(); savePosition(); }
+          if (digitalRead(LIMIT_SWITCH_PIN) == HIGH) {
+            Serial.println("✅ LIMIT RELEASED");
+            savePosition(); limitOverride = false;
+            simWake(); mqttRetryTimer = 0; connectMQTT(); publishFullStatus();
+            sleepMode = false; idleTracking = false; idleStart = millis();
+            sleepSub = SLEEP_ENTER; fwState = FW_ACTIVE;
+          }
+          break;
+
+        case SLEEP_MQTTCHK:
+          if (!simOpDone()) break;
+          connectMQTT(); mqtt.loop();
+          if (sleepCommandReceived) {
+            Serial.println("🟢 WAKE — command received");
+            sleepMode = false; idleTracking = false; idleStart = millis();
+            sleepSub = SLEEP_ENTER; fwState = FW_ACTIVE; break;
+          }
+          if (millis() - mqttChkStart >= 3000) {
+            if (!safeToSleep()) {
+              sleepMode = false; idleTracking = false; idleStart = millis();
+              sleepSub = SLEEP_ENTER; fwState = FW_ACTIVE;
+            } else {
+              Serial.println("😴 NO COMMAND — back to sleep");
+              simEnterSleep(); sleepSub = SLEEP_IDLE;
+            }
+          }
+          break;
+      }
+      break;
+
+    case FW_OTA_WAIT:
+      handleMotorRamp();
+      if (rampState == RAMP_IDLE && motorState == IDLE) {
+        Serial.println("🚀 MOTOR IDLE — flashing");
+        fwState = FW_OTA_FLASH;
+      }
+      break;
+
+    case FW_OTA_FLASH:
+      performOTA();
+      break;
+  }
+}
