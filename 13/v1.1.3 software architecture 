@@ -1,0 +1,3101 @@
+// ================== AWS FIRMWARE v1.1.3 ==================
+// ESP32-S3 Municipal Actuator — Session 14
+//
+// Base: aws_firmware_v1.1.2 — all prior features preserved, NO BEHAVIOR
+// CHANGES in this version. Purely additive architecture step.
+//
+// v1.1.3 CHANGES — DeviceState Snapshot, Step 1 of N (additive only):
+//
+//   [DEVSTATE] Added a DeviceState struct mirroring the safety/status-
+//             relevant globals (motor state, position/turns, calibration
+//             state, voltage state, fault flags, emergency-pending,
+//             connectivity, EOL certification, brownout flag) and a
+//             syncDeviceState() function that copies current global values
+//             into it on request.
+//
+//             This is explicitly STEP 1 of a planned multi-step migration
+//             toward a single source of truth for device state — NOT a
+//             replacement of the existing globals. No existing read or
+//             write site was touched. publishFullStatus() and
+//             publishDiagnostics() now call syncDeviceState() once at
+//             entry purely to exercise the mirror; every field they
+//             publish still reads the original raw globals exactly as in
+//             v1.1.2 — JSON output is byte-for-byte identical.
+//
+//             Future steps (not in this version): migrate individual call
+//             sites to read FROM deviceState instead of the raw globals,
+//             one module at a time, bench-verified between each step,
+//             before eventually making the raw globals private to their
+//             owning section. Deliberately not attempted in one pass —
+//             collapsing every safety-relevant global simultaneously would
+//             touch every motor/voltage/position guard condition at once
+//             with no way to verify each change in isolation on hardware.
+//
+//   [VER]   FW_VERSION bumped to aws-1.1.3
+//
+// ============================================================
+// v1.1.2 CHANGES — Brownout Reset Logging (no new state machine):
+//
+//   [BROWNOUT] Deliberately NOT a new recovery FSM. positionConfident
+//             remains the sole gatekeeper for motor blocking and for
+//             whether POSITION_UNCERTAIN fires — unchanged from v1.0.x.
+//             This adds only diagnostic/logging context on top of that
+//             existing mechanism:
+//
+//             - bootResetReason / bootWasBrownout captured once in
+//               setup() via esp_reset_reason(), cached for the boot.
+//             - If a brownout reset left position uncertain (motor was
+//               mid-move when power was lost — positionConfident was
+//               already false, exactly as it already worked), the
+//               existing POSITION_UNCERTAIN event now additionally
+//               carries "cause":"BROWNOUT". No behavior change — the
+//               operator still recovers via CALIBRATE_CLOSED or
+//               CONFIRM_POSITION exactly as before.
+//             - If a brownout reset did NOT leave position uncertain
+//               (valve was idle, last position had already been saved —
+//               a harmless power event), a one-time-per-boot informational
+//               "BROWNOUT_RESET" event is logged for maintenance records.
+//               No motor block, no operator action required.
+//             - GET_DIAGNOSTICS' reset_reason field now sources from the
+//               same cached bootResetReason rather than re-querying
+//               esp_reset_reason() a second time.
+//
+//             Any other reset cause (watchdog, panic, power-on, etc.)
+//             that leaves position uncertain is handled by the exact same
+//             pre-existing POSITION_UNCERTAIN path — brownout is not a
+//             special case for recovery purposes, only for logging.
+//
+//   [VER]   FW_VERSION bumped to aws-1.1.2
+//
+// ============================================================
+// v1.1.1 CHANGES — Shadow Diffing + GET_DIAGNOSTICS:
+//
+//   [SHADOWDIFF] publishShadowReported() now caches every field it has ever
+//             published (shadowLastReported) and diffs each new call
+//             against it — only genuinely changed fields are sent, and if
+//             nothing changed, the publish is skipped entirely. No call
+//             site needed to change; the diffing is transparent to every
+//             existing caller (bypass timeout, voltage recovery, emergency
+//             replay, NOT_EOL_TESTED). Reduces redundant AWS Shadow traffic
+//             without altering when/why any given call site decides to
+//             call publishShadowReported() in the first place.
+//
+//   [DIAG]  New GET_DIAGNOSTICS command — service/engineering view,
+//             deliberately separate from GET_STATUS (which remains the
+//             operator view: valve state, position, voltage status, fault,
+//             cal state, EOL status, firmware version). Diagnostics
+//             payload: free/min-free heap, heap size, uptime, ESP reset
+//             reason, LTE state machine state + registration retry count +
+//             APN, MQTT connection state, detailed sensor health strings,
+//             I2C fault/recovery counters, RTC validity/address, EOL
+//             status. Published only on request — no periodic timer.
+//             Does NOT re-probe the modem live (no blocking AT command)
+//             to avoid colliding with any in-flight LTE exchange; reports
+//             the firmware's own tracked lteReady/lteState instead.
+//
+//   [VER]   FW_VERSION bumped to aws-1.1.1
+//
+// ============================================================
+// v1.1.0 CHANGES — EOL Certification Tracking + NOT_EOL_TESTED Status:
+//
+//   [EOLCERT] The v1.0.8 EOL test mode ran fully isolated from AWS/MQTT and
+//             deliberately recorded no pass/fail result anywhere ("no
+//             EOL-pass NVS stamp" — see v1.0.8 notes below). That meant
+//             normal firmware had no way to know whether a unit had ever
+//             been certified. This version adds that missing record and
+//             surfaces it once the unit is back on AWS.
+//
+//             New NVS namespace "eol_cfg":
+//               cert_state   — 0=NOT_RUN, 1=FAILED, 2=PASSED (uint8_t)
+//               fail_count   — count of EOL_FAIL items on the qualifying run
+//               last_run_ts  — RTC ISO timestamp of that run (or
+//                              "RTC_INVALID"/"RTC_READ_ERR")
+//
+//             Written at the end of eolRunTestSequence() (still fully local,
+//             no AWS/MQTT dependency — EOL mode's independence from
+//             connectivity is unchanged). A run "PASSES" certification if
+//             none of its items came back EOL_FAIL; EOL_SKIP (e.g. MODEM_CHECK
+//             with no SIM installed yet) and EOL_INFO items do not block
+//             certification, matching the existing pass/fail/skip semantics
+//             each test routine already used.
+//
+//             EOL mode remains reentrant — running it again simply
+//             overwrites the previous cert_state, exactly like every other
+//             EOL result already worked. There is still no permanent
+//             lockout; this only adds a persisted record of the *last*
+//             result, not a one-time stamp.
+//
+//   [EOLCERT] Normal (non-EOL) firmware now loads this record at boot
+//             (loadEolCertification(), called alongside loadCalState() —
+//             before the EOL jumper check, same as every other piece of
+//             state the EOL report already displays) and:
+//               - includes "eol_status" in every publishFullStatus() payload,
+//                 via the same eolCertStatusStr() shared-mapper pattern used
+//                 for voltage/fault/valve state, so status topic and shadow
+//                 can never drift on wording
+//               - on a successful MQTT connect, if the unit is not currently
+//                 EOL_CERT_PASSED, publishes a "NOT_EOL_TESTED" event (event
+//                 topic) and an "eol_status" shadow field — ONCE PER BOOT,
+//                 gated by the eolNotTestedAnnounced flag, so a unit left
+//                 uncertified for an extended period doesn't re-announce
+//                 this on every reconnect. (CAL_INCOMPLETE/POSITION_UNCERTAIN
+//                 above do not have this gate and still announce on every
+//                 connect — left unchanged since those are rarer,
+//                 self-resolving conditions rather than a long-lived state.)
+//
+//             eolCertStatusStr() values: "CERTIFIED", "EOL_TEST_FAILED",
+//             "NOT_EOL_TESTED" — chosen to match the terminology already
+//             used for the equivalent LoRa-node-side event
+//             (EVT_NOT_EOL_TESTED) in the Orb Drive gateway/node protocol,
+//             even though this cellular-direct node has no LoRa wire
+//             protocol of its own — the mobile/web app can display a
+//             single consistent vocabulary ("EOL Test Pending" / "Not EOL
+//             Certified" / etc.) across both device families.
+//
+//             This is a status signal only — no motor/valve behavior is
+//             gated on cert_state. A never-certified unit still operates
+//             normally; the goal is visibility for commissioning/maintenance
+//             workflows, not a lockout.
+//
+//   [VER]   FW_VERSION bumped to aws-1.1.0
+//
+// ============================================================
+// v1.0.9 CHANGES — Autonomous Emergency Bypass Close + Shadow Consistency:
+//
+//   [BYPASS]  Emergency autonomous valve close after LOW_VOLTAGE_BYPASS
+//             timeout when no operator response (BYPASS_Y / BYPASS_N via
+//             F/R/S "Y"/"N" bypass prompt) is received within 2 minutes.
+//
+//             Sequence:
+//               CUT_V crossed while motor running -> stopMotor(), vState=
+//               WAIT_BYPASS, bypassWaitStart=millis(), event "CUT" published.
+//               Operator has BYPASS_TIMEOUT_MS (120000 ms / 2 min) to send
+//               Y (continue under bypass) or N (abandon, return to WARNING).
+//               If no response within the window:
+//                 - event BYPASS_TIMEOUT_AUTO_CLOSE published (if connected)
+//                 - vState forced to BYPASS_ACTIVE (suppresses CUT_V re-trip
+//                   so the forced close is not immediately re-interrupted)
+//                 - startMotor(REVERSE_RUN) forces the valve CLOSED,
+//                   regardless of what direction was interrupted
+//               This is independent of MQTT/LTE connectivity — the timeout
+//               and the close both run entirely on local timers/sensors.
+//
+//   [EMERGENCY] Autonomous emergency actions are persisted to NVS
+//             ("emergency" namespace) at the moment the firmware decides
+//             to act — before the motor is commanded — so the record
+//             survives a reboot at any point during or after the close.
+//             Record: reason, mqtt_conn (connectivity AT TRIGGER),
+//             valve_pos (totalTurns), battery_v, trigger_ts (RTC ISO,
+//             or literal "RTC_INVALID"/"RTC_READ_ERR" if RTC unavailable).
+//
+//             Replay: emergencyPublishIfPending() is called (a) immediately
+//             after a successful MQTT connect in connectMQTT(), and (b)
+//             every EMERGENCY_RETRY_MS (30 s) while already connected, in
+//             case the connect succeeded but the publish itself failed
+//             (broker hiccup, buffer limits, transient network condition —
+//             a successful mqtt.connect() does not guarantee publish()
+//             reaches the broker). NVS record is cleared ONLY after
+//             publish() returns true. If the same event is republished
+//             twice due to a lost ack, the duplicate carries identical
+//             device_id + trigger_time + reason and is straightforward to
+//             recognize/dedupe downstream. Design principle: never lose an
+//             emergency report; a duplicate is an acceptable tradeoff.
+//
+//             Also applies if startMotor(REVERSE_RUN) itself is rejected
+//             by a safety guard (lockFault/i2cFault/encFault/position
+//             uncertain) — the emergency record is still saved and
+//             published (valve_state will correctly read IDLE, and
+//             fault will correctly show the blocking condition), so the
+//             cloud is never left silently guessing whether a shadow
+//             update was lost, the firmware crashed, or the close was
+//             rejected.
+//
+//   [SHADOW] AWS Device Shadow ($aws/things/<id>/shadow/update) is now
+//             updated via a generic publishShadowReported(JsonObject)
+//             helper at every meaningful state transition (bypass timeout
+//             close-commanded, voltage genuinely recovered, emergency
+//             replay). Shadow always reflects CURRENT device state, never
+//             commanded/future state — e.g. valve_state is only published
+//             as "CLOSING" from the actual RAMP_BYPASS->RAMP_RUNNING
+//             transition in handleMotorRamp() (where motorState truly
+//             becomes REVERSE_RUN), not from the moment startMotor() is
+//             merely called. Event topic remains the sole historical/event
+//             log; shadow is state-only (voltage_status, bypass_active,
+//             fault, valve_state, last_event).
+//
+//   [STATUS] Consolidated three previously-duplicated string mappings
+//             (voltage status switch, fault if/else chain, and a new
+//             valve motion string) into shared helpers voltageStatusStr(),
+//             faultStatusStr(), valveStateStr(). Both publishFullStatus()
+//             (status topic) and all shadow publishes now source these
+//             strings from the same functions, so the two topics cannot
+//             drift apart on wording. faultStatusStr() still returns "OK"
+//             for no-fault (unchanged from shipped v1.0.8 status-topic
+//             vocabulary — NOT changed to "NONE", to avoid a breaking
+//             change for existing dashboards/rules).
+//
+//   [VER]   FW_VERSION bumped to aws-1.0.9
+//
+// ============================================================
+// v1.0.8 CHANGES — Factory EOL (End-Of-Line) Test Mode:
+//
+//   [EOL]   Local WiFi-AP-hosted manufacturing test, fully independent of
+//             AWS/MQTT/cellular. Entered by pulling GPIO45 LOW at boot
+//             (factory test-jig jumper; same pin previously documented as
+//             "push button — no FW handling", now repurposed for EOL entry).
+//
+//             Boot sequence:
+//               GPIO45 LOW at boot → skip LTE/MQTT entirely → start WiFi AP
+//               "VALVE-EOL-<last 4 hex of chip ID>", open (no password) →
+//               start HTTP server on 192.168.4.1 → run test sequence once →
+//               serve results as an HTML report → technician's laptop
+//               connects to the AP and views results in a browser.
+//
+//             Test sequence (each produces PASS / FAIL / SKIP):
+//               1. I2C_SCAN     — INA226 / AS5600 / PCF8563 detected + address
+//               2. RTC_CHECK    — write known time, read back, compare
+//               3. ENCODER_READ — raw angle + AGC value (magnet alignment)
+//               4. MOTOR_FWD    — 2 s soft-start pulse, checks encoder moved
+//                                 (>0.05 turns) and current stayed < CURRENT_OFF
+//               5. MOTOR_REV    — same checks, reverse direction
+//               6. LIMIT_SWITCH — reports current state (operator may toggle
+//                                 manually during the test window)
+//               7. BATTERY_V    — INA226 bus voltage, flagged if outside
+//                                 11.0–14.6 V (4S LiFePO4 safe range)
+//               8. BUZZER       — audible beep, informational only (no P/F)
+//               9. MODEM_CHECK  — PWRKEY pulse + AT ping; SKIP (not FAIL) if
+//                                 no response, since SIM/antenna may not yet
+//                                 be installed at this assembly stage
+//
+//             Existing NVS state (position, calibration, fault history) is
+//             preserved and displayed in the report, not wiped — diagnostic
+//             value matters more for a returned unit than a clean slate.
+//             EOL mode is reentrant: any unit can be retested at any time
+//             by pulling GPIO45 LOW at boot. There is no permanent lockout
+//             and no EOL-pass NVS stamp that disables future entry.
+//
+//             A "Reboot to normal mode" button on the report page calls
+//             ESP.restart(); the firmware then re-checks GPIO45 — removing
+//             the jumper before reboot returns the unit to normal AWS operation.
+//
+//   [VER]   FW_VERSION bumped to aws-1.0.8
+//
+// PIN MAP ADDITION:
+//   GPIO45  EOL test jumper (pull LOW at boot to enter EOL mode)
+//             *** Previously documented as "Push Button — no FW handling" ***
+//
+//   [CAL]   Previous single-command CALIBRATE replaced with a three-command
+//             operator-driven field calibration sequence.  The firmware never
+//             moves the valve autonomously — the operator drives it manually
+//             via normal F/R/S commands and sends calibration markers at each
+//             physical endpoint.
+//
+//           Calibration state machine (persisted in NVS "cal_state"):
+//
+//             CAL_IDLE
+//               │  CALIBRATE_CLOSED  (1st send — enter cal mode)
+//               ▼
+//             CAL_AWAITING_CLOSED
+//               │  F/R/S commands still accepted — operator drives to closed stop
+//               │  CALIBRATE_CANCEL → restore previous endpoints → CAL_IDLE
+//               │  CALIBRATE_CLOSED  (2nd send — record closed position)
+//               ▼
+//             CAL_CLOSED_SET
+//               │  rotationCount=0, totalTurns=0, MIN_TURNS=0 saved to NVS
+//               │  Publishes CAL_CLOSED_SET {turns:0}
+//               │  Previous MAX_TURNS backed up to NVS "max_turns_bak"
+//               │  F/R/S commands still accepted — operator drives to open stop
+//               │  CALIBRATE_CANCEL → restore backup endpoints → CAL_IDLE
+//               │  CALIBRATE_OPEN (single send — record open position)
+//               ▼
+//             CAL_COMPLETE  (transient — immediately returns to CAL_IDLE)
+//               │  MAX_TURNS = totalTurns, MIN_TURNS = 0
+//               │  positionConfident = HIGH
+//               │  Saves all to NVS
+//               │  Publishes CAL_COMPLETE {closed:0, open:X.XX, duration_ms:...}
+//               ▼
+//             CAL_IDLE
+//
+//           Safety rules during calibration:
+//             - Motor guards (voltage, current, I2C, encoder) all still active
+//             - CALIBRATE_OPEN rejected if not in CAL_CLOSED_SET state
+//             - If device reboots in CAL_AWAITING_CLOSED or CAL_CLOSED_SET:
+//                 motor is blocked, CAL_INCOMPLETE published on MQTT connect
+//                 operator must send CALIBRATE_CLOSED (restart) or CALIBRATE_CANCEL
+//             - Double-tap on CALIBRATE_CLOSED prevents accidental zero at wrong pos:
+//                 first send = enter mode, second send = confirm and record
+//
+//           New MQTT commands:
+//             CALIBRATE_CLOSED  {"cmd":"CALIBRATE_CLOSED","device_id":"..."}
+//             CALIBRATE_OPEN    {"cmd":"CALIBRATE_OPEN",  "device_id":"..."}
+//             CALIBRATE_CANCEL  {"cmd":"CALIBRATE_CANCEL","device_id":"..."}
+//
+//           Removed commands (replaced by above):
+//             CALIBRATE, SET_MIN_TURNS, CONFIRM_POSITION
+//             (CONFIRM_POSITION absorbed — completing calibration sets confidence)
+//
+//           MIN_TURNS fixed at 0.0 after calibration — closed stop is the
+//           absolute zero reference.  The 1.0-turn safety margin from v1.0.5
+//           is removed; the physical closed stop is the authoritative limit.
+//
+//   [VER]   FW_VERSION bumped to aws-1.0.7
+//
+//   [APN]   APN loaded from NVS instead of hardcoded "iot.com"
+//             Key "apn" in "aws_creds" NVS namespace (same namespace
+//             as TLS certs — provisioning sketch writes it once).
+//             Fallback: compile-time DEFAULT_APN if NVS key absent.
+//             New MQTT command: SET_APN {"cmd":"SET_APN","apn":"..."}
+//             Saves to NVS, takes effect on next LTE init or reboot.
+//             Current APN included in publishFullStatus() payload.
+//
+//   [MDM]   Modem changed from Quectel BG96 to SIMCom A7670C
+//             TinyGSM modem type: TINY_GSM_MODEM_A7670C
+//             PWRKEY pin: GPIO46 (MODEM_PWRKEY) — confirm vs schematic
+//             Power-on sequence:
+//               Pull PWRKEY LOW for 1500 ms → HIGH → wait 5 s for AT ready
+//             Power-off sequence:
+//               Send AT+CPOF (graceful) → wait for "NORMAL POWER DOWN" URC
+//               If URC not seen in 5 s: pulse PWRKEY LOW 3 s (hard off)
+//             Wake from deep sleep: PWRKEY pulse in setup() restores modem
+//             AT+CREG changed to AT+CREG? (A7670C response format unchanged)
+//             Ping command: AT+CPING instead of AT+QPING
+//             Baud rate: 115200 (same)
+//
+//   [SLP]   Sleep idle timeout configurable, not hardcoded at 10 s
+//             Default: 300 000 ms (5 minutes) — appropriate for municipal
+//             NVS key "sleep_timeout_ms" in "device_cfg" namespace
+//             New MQTT command: SET_SLEEP_TIMEOUT {"cmd":"SET_SLEEP_TIMEOUT",
+//               "value":300000}  (range: 30 000 – 3 600 000 ms)
+//             Keep-awake window: any MQTT command received resets a
+//             keepAwakeTimer; device will not sleep for KEEP_AWAKE_MS
+//             (60 s) after the last command, giving operator time to
+//             send follow-up commands without the device sleeping mid-session.
+//
+//   [CAL]   Calibration edge cases fixed
+//             After CALIBRATE, MIN_TURNS remains as a relative safety margin.
+//             If calibration is performed near the physical closed stop
+//             (i.e. position was < MIN_TURNS before calibration), the reverse
+//             block would trigger immediately after zeroing. Fixed by:
+//               - New configurable MIN_TURNS (was fixed 1.0)
+//               - New MQTT command: SET_MIN_TURNS {"cmd":"SET_MIN_TURNS",
+//                 "value":1.0}  (range: 0.0 – 5.0)
+//               - After CALIBRATE, CAL_DONE payload includes new zero and
+//                 current MIN_TURNS so operator can verify margin is sensible
+//               - CALIBRATE also accepts optional "min_turns" field to
+//                 atomically reset the margin at the same time as zeroing
+//
+//   [WDT]   Application watchdog added
+//             esp_task_wdt used with 60 s timeout on main loop task.
+//             WDT is fed in FW_ACTIVE loop tick (normal operation).
+//             LTE init: separate LTE_INIT_TIMEOUT_MS (120 s); if exceeded,
+//               modem is power-cycled via PWRKEY and LTE init restarts.
+//             MQTT: if not connected for MQTT_DEAD_MS (180 s) after LTE ready,
+//               full modem power-cycle + LTE reinit triggered.
+//             I2C: existing fail-count recovery unchanged; if recovery fails
+//               3× consecutive times, ESP.restart() is called (last resort).
+//             WDT is suspended during OTA flash (expected long operation).
+//
+//   [VER]   FW_VERSION bumped to aws-1.0.5
+//
+// PIN MAP — ESP32-S3 PCB (GPIO46 added for A7670C PWRKEY):
+//   GPIO40  K1 Relay FWD,    GPIO41  K2 Relay REV,   GPIO42  K3 Relay PWR
+//   GPIO36  Soft Start PWM,  GPIO8   I2C SDA,         GPIO9   I2C SCL
+//   GPIO2   INA226 Alert,    GPIO19  Limit Switch
+//   GPIO43  LTE UART TX,     GPIO44  LTE UART RX
+//   GPIO46  A7670C PWRKEY    *** NEW — verify vs schematic ***
+//   GPIO48  Buzzer,          GPIO1   VBAT ADC
+//   GPIO4   RTC Interrupt    (EXT0 deep-sleep wakeup)
+//   GPIO20  Flow Pulse (reserved), GPIO45 Push Button (HW reset)
+// =========================================================
+
+
+
+
+#include <Wire.h>
+#include <INA226_WE.h>
+#include <Preferences.h>
+#include <Update.h>
+#include <ArduinoJson.h>
+#include <mbedtls/sha256.h>
+#include <esp_sleep.h>
+#include <esp_system.h>
+#include <esp_task_wdt.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#define TINY_GSM_MODEM_A7670C
+#include <TinyGsmClient.h>
+#include <PubSubClient.h>
+
+
+
+
+HardwareSerial SerialAT(1);
+TinyGsm        modem(SerialAT);
+TinyGsmClientSecure gsmClient(modem, 0);
+TinyGsmClientSecure otaClient(modem, 1);
+PubSubClient   mqtt(gsmClient);
+
+
+
+
+// ================== FIRMWARE VERSION ==================
+#define FW_VERSION      "aws-1.1.3"
+#define FW_TYPE         "MUNICIPAL"
+bool    updateAvailable  = false;
+String  pendingUpdateURL = "";
+String  pendingUpdateVer = "";
+String  pendingUpdateSHA = "";
+
+
+
+
+// ================== AWS MQTT ==================
+String awsEndpoint   = "";
+String awsCert       = "";
+String awsPkey       = "";
+String awsRootCA     = "";
+const int awsPort    = 8883;
+
+String pubStatusTopic;
+String pubEventTopic;
+String subCmdTopic;
+String subUpdateTopic;
+String shadowUpdateTopic;
+String shadowAcceptedTopic;
+
+unsigned long mqttRetryTimer = 0;
+unsigned long mqttReadyTimer = 0;   // [WDT] tracks when LTE became ready
+
+String DEVICE_ID = "";
+void handleJSONCommand(String input);
+void connectMQTT();
+bool checkSensors();
+bool safeToSleep();
+
+
+
+
+// ================== PINS ==================
+#define RELAY_FWD        40
+#define RELAY_REV        41
+#define RELAY_PWR        42
+#define PWM_PIN          36
+#define SDA_PIN           8
+#define SCL_PIN           9
+#define INA_ALERT_PIN     2
+#define LIMIT_SWITCH_PIN 19
+#define MODEM_PWRKEY_PIN 46   // [MDM] A7670C PWRKEY — verify vs schematic
+#define BUZZER_PIN       48
+#define VBAT_ADC_PIN      1
+#define RTC_INT_PIN       4
+#define EOL_JUMPER_PIN   45   // [EOL] pull LOW at boot to enter factory test mode
+
+#define PWM_FREQ      5000
+#define PWM_RES          8
+#define RELAY_ON  LOW
+#define RELAY_OFF HIGH
+
+
+
+
+// ================== [APN] ACCESS POINT NAME ==================
+#define DEFAULT_APN  "iot.1nce.net"   // compile-time fallback
+String apn = DEFAULT_APN;             // runtime value, loaded from NVS in setup()
+
+void loadAPN() {
+  prefs.begin("aws_creds", true);
+  apn = prefs.getString("apn", DEFAULT_APN);
+  prefs.end();
+  Serial.print("📡 APN: "); Serial.println(apn);
+}
+
+void saveAPN(const String &newApn) {
+  prefs.begin("aws_creds", false);
+  prefs.putString("apn", newApn);
+  prefs.end();
+  apn = newApn;
+  Serial.print("💾 APN SAVED: "); Serial.println(apn);
+}
+
+
+
+
+// ================== [MDM] A7670C POWER CONTROL ==================
+// PWRKEY is active-low on the A7670C.
+// Power-on: pull low ≥1500 ms, then release. Module takes ~5 s to be AT-ready.
+// Power-off (graceful): AT+CPOF, wait for "NORMAL POWER DOWN" URC ≤5 s.
+//   If URC not received: pulse PWRKEY low 3 s (hard power-off).
+// Called from setup() on every boot (cold + wake) to ensure modem is on.
+
+#define A7670C_PWRON_PULSE_MS   1500UL   // PWRKEY low duration for power-on
+#define A7670C_PWRON_SETTLE_MS  5000UL   // wait after releasing PWRKEY
+#define A7670C_PWROFF_PULSE_MS  3000UL   // PWRKEY low duration for hard power-off
+#define A7670C_CPOF_TIMEOUT_MS  5000UL   // wait for "NORMAL POWER DOWN" after AT+CPOF
+
+// Probe whether the modem is already running (responds to AT)
+bool modemIsAlive() {
+  while (SerialAT.available()) SerialAT.read();   // flush
+  SerialAT.println("AT");
+  unsigned long t = millis();
+  String resp = "";
+  while (millis() - t < 500) {
+    while (SerialAT.available()) resp += (char)SerialAT.read();
+    if (resp.indexOf("OK") != -1) return true;
+  }
+  return false;
+}
+
+// Power on A7670C via PWRKEY pulse.
+// Skipped if modem already responds to AT (avoids double-pulse on warm boot).
+void modemPowerOn() {
+  if (modemIsAlive()) {
+    Serial.println("📶 A7670C already alive — skipping power-on pulse");
+    return;
+  }
+  Serial.println("📶 A7670C POWER ON — PWRKEY pulse");
+  digitalWrite(MODEM_PWRKEY_PIN, LOW);
+  delay(A7670C_PWRON_PULSE_MS);
+  digitalWrite(MODEM_PWRKEY_PIN, HIGH);
+  Serial.println("📶 Waiting for A7670C ready...");
+  delay(A7670C_PWRON_SETTLE_MS);
+}
+
+// Graceful power-off: AT+CPOF → wait for URC → hard pulse on timeout
+void modemPowerOff() {
+  Serial.println("📴 A7670C POWER OFF — AT+CPOF");
+  while (SerialAT.available()) SerialAT.read();
+  SerialAT.println("AT+CPOF");
+  unsigned long t = millis();
+  String resp = "";
+  while (millis() - t < A7670C_CPOF_TIMEOUT_MS) {
+    while (SerialAT.available()) resp += (char)SerialAT.read();
+    if (resp.indexOf("NORMAL POWER DOWN") != -1) {
+      Serial.println("✅ A7670C graceful power-down confirmed");
+      return;
+    }
+  }
+  // URC not received — hard power-off via PWRKEY
+  Serial.println("⚠️ AT+CPOF timeout — hard PWRKEY power-off");
+  digitalWrite(MODEM_PWRKEY_PIN, LOW);
+  delay(A7670C_PWROFF_PULSE_MS);
+  digitalWrite(MODEM_PWRKEY_PIN, HIGH);
+  delay(500);
+  Serial.println("✅ A7670C hard power-off complete");
+}
+
+// Power-cycle: off then on. Used by watchdog recovery and LTE reinit.
+void modemPowerCycle() {
+  Serial.println("🔄 MODEM POWER CYCLE");
+  modemPowerOff();
+  delay(1000);
+  modemPowerOn();
+}
+
+
+
+
+// ================== [HW] I2C DEVICE ADDRESS GLOBALS ==================
+uint8_t inaAddr = 0x00;
+uint8_t encAddr = 0x00;
+uint8_t rtcAddr = 0x00;
+INA226_WE* ina226 = nullptr;
+
+
+
+
+// ================== [VBAT] RAW BATTERY ADC ==================
+#define VBAT_DIVIDER_RATIO  5.0f
+#define VBAT_ADC_REF_MV     3300.0f
+#define VBAT_ADC_RES        4095.0f
+unsigned long vbatReadTimer = 0;
+float         vbatMV        = 0.0f;
+
+float readVBAT_mV() {
+  int raw = analogRead(VBAT_ADC_PIN);
+  return ((float)raw / VBAT_ADC_RES) * VBAT_ADC_REF_MV * VBAT_DIVIDER_RATIO;
+}
+
+volatile bool inaAlertFlag = false;
+void IRAM_ATTR inaAlertISR() { inaAlertFlag = true; }
+
+
+
+
+// ================== [RTC] PCF8563 DRIVER ==================
+volatile bool rtcAlarmFlag = false;
+void IRAM_ATTR rtcAlarmISR() { rtcAlarmFlag = true; }
+
+uint8_t bcdToDec(uint8_t b) { return (b / 16 * 10) + (b % 16); }
+uint8_t decToBcd(uint8_t d) { return (d / 10 * 16) + (d % 10); }
+
+bool rtcGetTime(struct tm &t) {
+  Wire.beginTransmission(rtcAddr); Wire.write(0x02);
+  if (Wire.endTransmission(false) != 0) return false;
+  Wire.requestFrom(rtcAddr, (uint8_t)7);
+  if (Wire.available() < 7) return false;
+  uint8_t sec = Wire.read();
+  if (sec & 0x80) return false;
+  t.tm_sec  = bcdToDec(sec  & 0x7F);
+  t.tm_min  = bcdToDec(Wire.read() & 0x7F);
+  t.tm_hour = bcdToDec(Wire.read() & 0x3F);
+  t.tm_mday = bcdToDec(Wire.read() & 0x3F);
+  t.tm_wday = bcdToDec(Wire.read() & 0x07);
+  t.tm_mon  = bcdToDec(Wire.read() & 0x1F) - 1;
+  t.tm_year = bcdToDec(Wire.read()) + 100;
+  return true;
+}
+
+bool rtcSetTime(const struct tm &t) {
+  Wire.beginTransmission(rtcAddr); Wire.write(0x02);
+  Wire.write(decToBcd(t.tm_sec)  & 0x7F);
+  Wire.write(decToBcd(t.tm_min)  & 0x7F);
+  Wire.write(decToBcd(t.tm_hour) & 0x3F);
+  Wire.write(decToBcd(t.tm_mday) & 0x3F);
+  Wire.write(decToBcd(t.tm_wday) & 0x07);
+  Wire.write(decToBcd(t.tm_mon + 1) & 0x1F);
+  Wire.write(decToBcd(t.tm_year - 100));
+  return Wire.endTransmission() == 0;
+}
+
+bool rtcIsValid() {
+  if (rtcAddr == 0x00) return false;
+  Wire.beginTransmission(rtcAddr); Wire.write(0x02);
+  if (Wire.endTransmission(false) != 0) return false;
+  Wire.requestFrom(rtcAddr, (uint8_t)1);
+  if (!Wire.available()) return false;
+  return !(Wire.read() & 0x80);
+}
+
+String rtcFormatISO(const struct tm &t) {
+  char buf[25];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+           t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+           t.tm_hour, t.tm_min, t.tm_sec);
+  return String(buf);
+}
+
+String getTimestamp() {
+  struct tm t;
+  if (!rtcIsValid())   return "RTC_INVALID";
+  if (!rtcGetTime(t)) return "RTC_READ_ERR";
+  return rtcFormatISO(t);
+}
+
+bool parseISO(const String &iso, struct tm &t) {
+  if (iso.length() < 19) return false;
+  t.tm_year = iso.substring(0,  4).toInt() - 1900;
+  t.tm_mon  = iso.substring(5,  7).toInt() - 1;
+  t.tm_mday = iso.substring(8,  10).toInt();
+  t.tm_hour = iso.substring(11, 13).toInt();
+  t.tm_min  = iso.substring(14, 16).toInt();
+  t.tm_sec  = iso.substring(17, 19).toInt();
+  int y = t.tm_year + 1900; int m = t.tm_mon + 1;
+  if (m < 3) { m += 12; y--; }
+  int k = y % 100; int j = y / 100;
+  int h = (t.tm_mday + (13*(m+1))/5 + k + k/4 + j/4 + 5*j) % 7;
+  t.tm_wday = (h + 6) % 7;
+  return true;
+}
+
+
+
+
+// ================== [HW] HARDWARE AUTO-DETECTION ==================
+bool validateINA226(uint8_t addr) {
+  Wire.beginTransmission(addr); Wire.write(0xFE);
+  if (Wire.endTransmission(false) != 0) return false;
+  Wire.requestFrom(addr, (uint8_t)2);
+  if (Wire.available() < 2) return false;
+  return (((uint16_t)Wire.read() << 8) | Wire.read()) == 0x5449;
+}
+
+bool validateAS5600(uint8_t addr) {
+  Wire.beginTransmission(addr); Wire.write(0x0B);
+  if (Wire.endTransmission(false) != 0) return false;
+  Wire.requestFrom(addr, (uint8_t)1);
+  if (!Wire.available()) return false;
+  return (Wire.read() & 0x38) != 0;
+}
+
+bool validatePCF8563(uint8_t addr) {
+  Wire.beginTransmission(addr); Wire.write(0x0D);
+  if (Wire.endTransmission(false) != 0) return false;
+  Wire.requestFrom(addr, (uint8_t)1);
+  if (!Wire.available()) return false;
+  return (Wire.read() & 0x78) == 0x00;
+}
+
+bool i2cAck(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission() == 0;
+}
+
+void saveHWProfile() {
+  prefs.begin("hw_profile", false);
+  prefs.putUChar("ina_addr", inaAddr);
+  prefs.putUChar("enc_addr", encAddr);
+  prefs.putUChar("rtc_addr", rtcAddr);
+  prefs.end();
+  Serial.printf("💾 HW PROFILE SAVED — INA:0x%02X ENC:0x%02X RTC:0x%02X\n",
+                inaAddr, encAddr, rtcAddr);
+}
+
+void loadHWProfile() {
+  prefs.begin("hw_profile", true);
+  inaAddr = prefs.getUChar("ina_addr", 0x00);
+  encAddr = prefs.getUChar("enc_addr", 0x00);
+  rtcAddr = prefs.getUChar("rtc_addr", 0x00);
+  prefs.end();
+}
+
+void publishHWProfile();   // forward declaration
+
+bool detectHardware() {
+  Serial.println("🔍 HW DETECT — loading NVS cache...");
+  loadHWProfile();
+  bool inaOK = false, encOK = false, rtcOK = false;
+
+  if (inaAddr != 0x00 && i2cAck(inaAddr) && validateINA226(inaAddr))
+    { Serial.printf("✅ INA226 @ 0x%02X (cached)\n", inaAddr); inaOK = true; }
+  if (encAddr != 0x00 && i2cAck(encAddr) && validateAS5600(encAddr))
+    { Serial.printf("✅ AS5600 @ 0x%02X (cached)\n", encAddr); encOK = true; }
+  if (rtcAddr != 0x00 && i2cAck(rtcAddr) && validatePCF8563(rtcAddr))
+    { Serial.printf("✅ PCF8563 @ 0x%02X (cached)\n", rtcAddr); rtcOK = true; }
+
+  if (!inaOK || !encOK || !rtcOK) {
+    Serial.println("🔍 HW DETECT — full bus scan...");
+    if (!inaOK) {
+      inaAddr = 0x00;
+      for (uint8_t addr = 0x40; addr <= 0x4F; addr++) {
+        if (i2cAck(addr) && validateINA226(addr))
+          { inaAddr = addr; Serial.printf("✅ INA226 @ 0x%02X\n", addr); inaOK = true; break; }
+      }
+      if (!inaOK) Serial.println("❌ INA226 NOT FOUND");
+    }
+    if (!encOK) {
+      encAddr = 0x00;
+      if (i2cAck(0x36) && validateAS5600(0x36))
+        { encAddr = 0x36; Serial.println("✅ AS5600 @ 0x36"); encOK = true; }
+      else Serial.println("❌ AS5600 NOT FOUND");
+    }
+    if (!rtcOK) {
+      // Scan 0x50–0x57 — covers PCF8563 (0x51), HYM8563 (0x51), and
+      // any compatible clone that may sit at a neighbouring address on
+      // future board revisions.  Same pattern as INA226 (0x40–0x4F).
+      rtcAddr = 0x00;
+      for (uint8_t addr = 0x50; addr <= 0x57; addr++) {
+        if (i2cAck(addr) && validatePCF8563(addr)) {
+          rtcAddr = addr;
+          Serial.printf("✅ PCF8563 found @ 0x%02X\n", addr);
+          rtcOK = true;
+          break;
+        }
+      }
+      if (!rtcOK) Serial.println("❌ PCF8563 NOT FOUND (scanned 0x50–0x57)");
+    }
+    if (inaOK && encOK && rtcOK) saveHWProfile();
+  }
+
+  bool allOK = inaOK && encOK && rtcOK;
+  if (!allOK)
+    Serial.printf("🔴 HW DETECT FAILED — INA:%s ENC:%s RTC:%s\n",
+                  inaOK?"OK":"MISSING", encOK?"OK":"MISSING", rtcOK?"OK":"MISSING");
+  else
+    Serial.println("✅ HW DETECT COMPLETE");
+  return allOK;
+}
+
+
+
+
+// ================== [SCHED] SCHEDULE ENGINE ==================
+#define SCHED_SLOTS 8
+struct SchedSlot {
+  bool    enabled;
+  uint8_t action;
+  uint8_t hour;
+  uint8_t minute;
+  char    days[8];
+};
+SchedSlot schedSlots[SCHED_SLOTS];
+
+void saveSchedule() {
+  prefs.begin("schedule", false);
+  for (int i = 0; i < SCHED_SLOTS; i++) {
+    String key = "slot" + String(i);
+    uint8_t buf[12];
+    buf[0]=schedSlots[i].enabled?1:0; buf[1]=schedSlots[i].action;
+    buf[2]=schedSlots[i].hour;        buf[3]=schedSlots[i].minute;
+    memcpy(buf+4, schedSlots[i].days, 7); buf[11]=0;
+    prefs.putBytes(key.c_str(), buf, 12);
+  }
+  prefs.end();
+  Serial.println("💾 SCHEDULE SAVED");
+}
+
+void loadSchedule() {
+  prefs.begin("schedule", true);
+  for (int i = 0; i < SCHED_SLOTS; i++) {
+    String key = "slot" + String(i);
+    uint8_t buf[12] = {0};
+    size_t len = prefs.getBytes(key.c_str(), buf, 12);
+    if (len == 12) {
+      schedSlots[i].enabled=buf[0]; schedSlots[i].action=buf[1];
+      schedSlots[i].hour=buf[2];    schedSlots[i].minute=buf[3];
+      memcpy(schedSlots[i].days, buf+4, 7); schedSlots[i].days[7]='\0';
+    } else {
+      schedSlots[i].enabled=false; schedSlots[i].action=0;
+      schedSlots[i].hour=0;        schedSlots[i].minute=0;
+      memcpy(schedSlots[i].days, "0000000", 7); schedSlots[i].days[7]='\0';
+    }
+  }
+  prefs.end();
+  Serial.println("📂 SCHEDULE LOADED");
+}
+
+bool slotActiveToday(const SchedSlot &slot, int wday) { return slot.days[wday]=='1'; }
+
+void armAlarm1(uint8_t hour, uint8_t minute) {
+  if (rtcAddr == 0x00) return;
+  Wire.beginTransmission(rtcAddr); Wire.write(0x01);
+  if (Wire.endTransmission(false) == 0) {
+    Wire.requestFrom(rtcAddr, (uint8_t)1);
+    uint8_t ctrl2 = Wire.available() ? Wire.read() : 0;
+    ctrl2 &= ~0x08;
+    Wire.beginTransmission(rtcAddr); Wire.write(0x01); Wire.write(ctrl2); Wire.endTransmission();
+  }
+  Wire.beginTransmission(rtcAddr); Wire.write(0x09);
+  Wire.write(decToBcd(minute)&0x7F); Wire.write(decToBcd(hour)&0x3F);
+  Wire.write(0x80); Wire.write(0x80); Wire.endTransmission();
+  Wire.beginTransmission(rtcAddr); Wire.write(0x01);
+  if (Wire.endTransmission(false) == 0) {
+    Wire.requestFrom(rtcAddr, (uint8_t)1);
+    uint8_t ctrl2 = Wire.available() ? Wire.read() : 0;
+    ctrl2 |= 0x02;
+    Wire.beginTransmission(rtcAddr); Wire.write(0x01); Wire.write(ctrl2); Wire.endTransmission();
+  }
+  Serial.printf("⏰ ALARM ARMED: %02d:%02d\n", hour, minute);
+}
+
+void clearAlarm1Flag() {
+  if (rtcAddr == 0x00) return;
+  Wire.beginTransmission(rtcAddr); Wire.write(0x01);
+  if (Wire.endTransmission(false) != 0) return;
+  Wire.requestFrom(rtcAddr, (uint8_t)1);
+  uint8_t ctrl2 = Wire.available() ? Wire.read() : 0;
+  ctrl2 &= ~0x08;
+  Wire.beginTransmission(rtcAddr); Wire.write(0x01); Wire.write(ctrl2); Wire.endTransmission();
+}
+
+void armNextAlarm() {
+  if (!rtcIsValid()) { Serial.println("⚠️ RTC invalid — cannot arm scheduler"); return; }
+  struct tm now; if (!rtcGetTime(now)) return;
+  int bestSlot=-1, bestMinutes=9999, nowMinutes=now.tm_hour*60+now.tm_min;
+  for (int i=0; i<SCHED_SLOTS; i++) {
+    if (!schedSlots[i].enabled) continue;
+    for (int d=0; d<=7; d++) {
+      int wday=(now.tm_wday+d)%7;
+      if (!slotActiveToday(schedSlots[i], wday)) continue;
+      int slotMin=schedSlots[i].hour*60+schedSlots[i].minute;
+      int diff=(d==0)?(slotMin-nowMinutes):(d*1440+slotMin-nowMinutes);
+      if (d==0 && diff<=0) continue;
+      if (diff<bestMinutes) { bestMinutes=diff; bestSlot=i; }
+      break;
+    }
+  }
+  if (bestSlot==-1) { Serial.println("📅 No active schedule slots"); return; }
+  armAlarm1(schedSlots[bestSlot].hour, schedSlots[bestSlot].minute);
+  Serial.printf("📅 Next: slot %d → %s at %02d:%02d\n", bestSlot,
+                schedSlots[bestSlot].action==0?"OPEN":"CLOSE",
+                schedSlots[bestSlot].hour, schedSlots[bestSlot].minute);
+}
+
+void handleScheduledAlarms() {
+  if (!rtcIsValid()) return;
+  struct tm now; if (!rtcGetTime(now)) return;
+  for (int i=0; i<SCHED_SLOTS; i++) {
+    if (!schedSlots[i].enabled) continue;
+    if (!slotActiveToday(schedSlots[i], now.tm_wday)) continue;
+    if (schedSlots[i].hour   != (uint8_t)now.tm_hour) continue;
+    if (schedSlots[i].minute != (uint8_t)now.tm_min)  continue;
+    Serial.printf("📅 SCHED ACTION: slot %d → %s\n", i,
+                  schedSlots[i].action==0?"OPEN":"CLOSE");
+    if (schedSlots[i].action==0) startMotor(FORWARD_RUN);
+    else                         startMotor(REVERSE_RUN);
+    if (mqtt.connected()) {
+      StaticJsonDocument<192> doc;
+      doc["device_id"]=DEVICE_ID; doc["sched_event"]=schedSlots[i].action==0?"SCHED_OPEN":"SCHED_CLOSE";
+      doc["slot"]=i; doc["ts"]=getTimestamp();
+      String out; serializeJson(doc, out);
+      mqtt.publish(pubEventTopic.c_str(), out.c_str(), false, 1);
+    }
+  }
+  clearAlarm1Flag(); armNextAlarm();
+}
+
+void publishSchedule() {
+  StaticJsonDocument<512> doc;
+  doc["device_id"]=DEVICE_ID; doc["ts"]=getTimestamp();
+  JsonArray arr=doc.createNestedArray("schedule");
+  for (int i=0; i<SCHED_SLOTS; i++) {
+    JsonObject s=arr.createNestedObject();
+    s["slot"]=i; s["enabled"]=schedSlots[i].enabled;
+    s["action"]=schedSlots[i].action==0?"OPEN":"CLOSE";
+    s["hour"]=schedSlots[i].hour; s["minute"]=schedSlots[i].minute;
+    s["days"]=String(schedSlots[i].days);
+  }
+  String out; serializeJson(doc, out);
+  mqtt.publish(pubStatusTopic.c_str(), out.c_str(), false, 1);
+  Serial.print("📤 SCHEDULE: "); Serial.println(out);
+}
+
+
+
+
+// ================== MOTOR STATES ==================
+enum State { IDLE, FORWARD_RUN, REVERSE_RUN };
+State motorState      = IDLE;
+State lastDirection   = FORWARD_RUN;
+State resumeDirection = IDLE;
+bool  resumePending   = false;
+
+
+
+
+// ================== FIRMWARE STATE ==================
+enum FirmwareState {
+  FW_LTE_INIT, FW_TLS_INIT, FW_BOOT_VALIDATE,
+  FW_INIT, FW_ACTIVE, FW_SLEEP, FW_OTA_WAIT, FW_OTA_FLASH
+};
+FirmwareState fwState = FW_LTE_INIT;
+
+
+
+
+// ================== [DEEP] WAKE REASON ==================
+bool isScheduledWake = false;
+bool idleTracking = false;
+
+
+
+
+// ================== LIMITS ==================
+// [CAL] MIN_TURNS is always 0.0 after calibration — the closed physical stop
+// is the absolute zero reference.  Set to 1.0 on first boot (before any
+// calibration) as a conservative safety margin until the operator calibrates.
+float MIN_TURNS = 1.0;   // overwritten to 0.0 on CAL_COMPLETE
+float MAX_TURNS = 10.0;
+
+
+
+
+// ================== [SLP] CONFIGURABLE SLEEP TIMEOUT ==================
+#define DEFAULT_SLEEP_TIMEOUT_MS  300000UL   // 5 minutes
+#define MIN_SLEEP_TIMEOUT_MS       30000UL   // 30 seconds (floor)
+#define MAX_SLEEP_TIMEOUT_MS     3600000UL   // 1 hour (ceiling)
+#define KEEP_AWAKE_MS              60000UL   // stay awake 60 s after last command
+
+unsigned long sleepTimeoutMs   = DEFAULT_SLEEP_TIMEOUT_MS;
+unsigned long keepAwakeTimer   = 0;
+bool          keepAwakeActive  = false;
+
+
+
+
+// ================== [WDT] WATCHDOG TIMERS ==================
+#define WDT_TIMEOUT_S          60      // hardware task watchdog (seconds)
+#define LTE_INIT_TIMEOUT_MS    120000UL  // LTE init hard deadline
+#define MQTT_DEAD_MS           180000UL  // max time LTE ready but no MQTT
+
+unsigned long lteInitStartTime = 0;
+int           i2cRecoveryCount = 0;    // consecutive I2C recovery failures
+#define I2C_RECOVERY_RESET_THRESHOLD  3  // ESP.restart() after this many
+
+
+
+
+// ================== VOLTAGE — 4S LiFePO4 ==================
+#define WARN_V_LOW  12.0
+#define WARN_V_HIGH 12.4
+#define CUT_V       11.6
+#define CRITICAL_V  11.2
+#define RESET_V     12.0
+#define BYPASS_TIMEOUT_MS  120000UL   // [BYPASS] 2 min operator response window
+
+enum VoltageState { NORMAL, WARNING, WAIT_BYPASS, BYPASS_ACTIVE, LOCKED };
+VoltageState vState = NORMAL;
+unsigned long bypassWaitStart = 0;   // [BYPASS] timestamp WAIT_BYPASS was entered
+
+
+
+
+// ================== [BYPASS] DEFERRED SHADOW PUBLISH FLAG ==================
+// Set when an emergency auto-close is COMMANDED (startMotor accepted), and
+// consumed/cleared the moment motorState ACTUALLY becomes REVERSE_RUN in
+// handleMotorRamp()'s RAMP_BYPASS->RAMP_RUNNING transition. This ensures the
+// shadow's valve_state is only ever published as "CLOSING" once it is true,
+// never at the moment the close is merely commanded.
+bool bypassTimeoutClosePending = false;
+
+
+
+
+// ================== [EMERGENCY] OFFLINE EMERGENCY ACTION STATE ==================
+bool          emergencyPending   = false;   // RAM mirror of NVS "pending" flag
+unsigned long lastEmergencyRetry = 0;
+#define EMERGENCY_RETRY_MS  30000UL         // retry publish every 30 s while connected
+
+
+
+
+// ================== [EOLCERT] EOL CERTIFICATION STATE ==================
+// Mirrors, in RAM, the result of the last factory EOL test run (see [EOL]
+// section near the bottom of this file). NOT_RUN is the default for any
+// unit that has never had EOL mode entered at all. Declared early (enum +
+// global only) so connectMQTT()/publishFullStatus(), which are defined
+// before the [EOL] section itself, can reference it — actual
+// load/save/string-mapper function bodies live in the [STATUS] section
+// alongside the other shared state-string mappers.
+enum EolCertState { EOL_CERT_NOT_RUN, EOL_CERT_FAILED, EOL_CERT_PASSED };
+EolCertState eolCertState = EOL_CERT_NOT_RUN;
+bool eolNotTestedAnnounced = false;   // [EOLCERT] true once NOT_EOL_TESTED has been announced this boot
+
+
+
+
+// ================== [BROWNOUT] BOOT RESET REASON ==================
+// Captured once in setup() via esp_reset_reason() and cached here — no new
+// recovery state machine. positionConfident remains the sole gatekeeper for
+// whether the motor is blocked and whether POSITION_UNCERTAIN fires;
+// bootWasBrownout is used only to (a) tag that existing event with a
+// "cause" field when position genuinely was left uncertain, and (b) log a
+// separate, harmless, informational BROWNOUT_RESET event when the valve
+// was idle with a known position at the time of the brownout — i.e. no
+// action needed, logged for maintenance records only.
+esp_reset_reason_t bootResetReason   = ESP_RST_UNKNOWN;
+bool                bootWasBrownout   = false;
+bool                brownoutAnnounced = false;   // true once BROWNOUT_RESET (or its absence) has been evaluated this boot
+
+
+
+
+// ================== CURRENT ==================
+float CURRENT_OFF = 1.5;
+#define RETRY_DELAY 30000
+int  retryCount  = 0;
+bool ocFault     = false;
+bool lockFault   = false;
+unsigned long ocTripTime = 0;
+
+
+
+
+// ================== ENCODER ==================
+int16_t angle = 0, prevAngle = 0;
+long    rotationCount = 0;
+float   totalTurns    = 0;
+bool    encFault          = false;
+bool    agcWarn           = false;
+bool    encFaultPublished = false;
+
+
+
+
+// ================== [POS] POSITION CONFIDENCE ==================
+bool positionConfident = true;
+
+void setPositionConfidence(bool confident) {
+  positionConfident = confident;
+  prefs.begin("encoder", false);
+  prefs.putBool("pos_conf", confident);
+  prefs.end();
+}
+
+
+
+
+// ================== FLAGS ==================
+bool lastLimitState  = HIGH;
+bool lastOvercurrent = false;
+bool limitOverride   = false;
+bool lteReady        = false;
+bool tlsReady        = false;
+bool i2cFault        = false;
+
+
+
+
+// ================== TIMERS ==================
+unsigned long dashboardTimer     = 0;
+unsigned long idleStart          = 0;
+unsigned long warnPrintTimer     = 0;
+unsigned long saveTimer          = 0;
+unsigned long sensorCheckTimer   = 0;
+unsigned long buzzerTimer        = 0;
+
+
+
+
+// ================== [LTE-NB] LTE INIT STATE MACHINE ==================
+enum LteInitState {
+  LTE_AT, LTE_CPIN, LTE_CSQ, LTE_CREG,
+  LTE_CGATT, LTE_CGDCONT, LTE_CGACT, LTE_CGPADDR,
+  LTE_PING, LTE_DONE
+};
+LteInitState  lteState    = LTE_AT;
+unsigned long lteTimer    = 0;
+int           lteRegTries = 0;
+#define LTE_STEP_MS   1000UL
+#define LTE_REG_MS    2000UL
+#define LTE_LONG_MS   3000UL
+#define LTE_XLONG_MS  5000UL
+
+
+
+
+// ================== RAMP STATE MACHINE ==================
+enum RampState {
+  RAMP_IDLE, RAMP_UP, RAMP_BYPASS,
+  RAMP_RUNNING, RAMP_DOWN_INIT, RAMP_DOWN, RAMP_DONE
+};
+RampState     rampState  = RAMP_IDLE;
+#define RAMP_SETTLE_MS  1000UL
+#define RAMP_STEP_MS      30UL
+unsigned long rampTimer  = 0;
+unsigned long rampSettle = 0;
+int           rampDuty   = 0;
+State         rampDir    = IDLE;
+
+
+
+
+// ================== [I2C-REC] FAIL COUNTERS ==================
+int inaFailCount = 0;
+int encFailCount = 0;
+
+
+
+
+// ================== [ROLLBACK] ==================
+#define BOOT_VALIDATE_MS  30000UL
+unsigned long bootValidateTimer = 0;
+bool          bootValidateDone  = false;
+
+
+
+
+// ================== FORWARD DECLARATIONS ==================
+bool isRetryActive();
+bool safeToSleep();
+bool calInProgress();   // defined in [CAL] section — needed early by faultStatusStr()/startMotor()
+void stopMotor();
+bool startMotor(State dir);   // [BYPASS] now returns bool — true if ramp actually started
+void publishFullStatus();
+void publishPosition(State stoppedFrom);
+void publishVoltageEvent(String event, float v);
+void publishCurrentEvent(String event, float current);
+void handleEncoder();
+void configureINAAlert();
+void clearRelays();
+void enterDeepSleep();
+const char* voltageStatusStr();
+const char* faultStatusStr();
+const char* valveStateStr();
+const char* eolCertStatusStr();          // [EOLCERT]
+void        loadEolCertification();      // [EOLCERT]
+void        saveEolCertification(EolCertState state, int failCount);   // [EOLCERT]
+void publishShadowReported(JsonObject fields);
+void emergencySaveTrigger(const char* reason);
+bool emergencyHasPending();
+void emergencyClearPending();
+void emergencyPublishIfPending();
+Preferences prefs;
+
+
+
+
+// ================== UNIFIED SLEEP GUARD ==================
+bool safeToSleep() {
+  return (motorState == IDLE      &&
+          rampState  == RAMP_IDLE &&
+          !resumePending          &&
+          !isRetryActive());
+}
+
+
+
+
+// ================== HELPERS ==================
+float getVoltage() { return ina226 ? ina226->getBusVoltage_V() : 0.0f; }
+float getCurrent() { return ina226 ? abs(ina226->getCurrent_mA()) / 1000.0f : 0.0f; }
+
+String getDeviceID() {
+  prefs.begin("aws_creds", true);
+  String id = prefs.getString("device_id", "");
+  prefs.end();
+  if (id.length() > 0) return id;
+  uint64_t chipid = ESP.getEfuseMac();
+  char buf[28];
+  sprintf(buf, "ESP32S3-%04X%08X", (uint16_t)(chipid >> 32), (uint32_t)chipid);
+  return String(buf);
+}
+
+// [SLP] Called by every MQTT command handler to reset the keep-awake window
+void touchKeepAwake() {
+  keepAwakeTimer  = millis();
+  keepAwakeActive = true;
+}
+
+
+
+
+// ================== [STATUS] SHARED STATE-STRING MAPPERS ==================
+// Single source of truth for every derived state string. Used identically
+// by publishFullStatus() (status topic) and every publishShadowReported()
+// call site (shadow topic) so the two can never drift apart on wording.
+
+const char* voltageStatusStr() {
+  switch (vState) {
+    case NORMAL:        return "NORMAL";
+    case WARNING:       return "WARNING";
+    case WAIT_BYPASS:   return "LOW_VOLTAGE_CUT";
+    case BYPASS_ACTIVE: return "BYPASS_ACTIVE";
+    case LOCKED:        return "CRITICAL_LOCK";
+  }
+  return "UNKNOWN";
+}
+
+// NOTE: kept as "OK" (not "NONE") to match the value publishFullStatus()
+// already emits on the status topic in shipped v1.0.8 — changing this
+// string would be a breaking change for existing dashboards/rules.
+const char* faultStatusStr() {
+  if      (lockFault)          return "CURRENT_LOCK";
+  else if (vState==LOCKED)     return "VOLTAGE_LOCK";
+  else if (i2cFault)           return "I2C_FAULT";
+  else if (encFault)           return "ENC_FAULT";
+  else if (calInProgress())    return "CAL_IN_PROGRESS";
+  else if (!positionConfident) return "POSITION_UNCERTAIN";
+  else                          return "OK";
+}
+
+// Valve motion state — distinct from voltage/fault state. Reads motorState
+// ONLY (current, actual state) — deliberately does NOT inspect rampState/
+// rampDir/commanded intent, so it can never report a future/commanded state
+// before that state is genuinely true.
+const char* valveStateStr() {
+  if      (motorState==FORWARD_RUN) return "OPENING";
+  else if (motorState==REVERSE_RUN) return "CLOSING";
+  else                                return "IDLE";
+}
+
+// [EOLCERT] Shared mapper for EOL certification status — same
+// single-source-of-truth pattern as voltageStatusStr()/faultStatusStr()/
+// valveStateStr() above. Sourced from eolCertState, which is loaded from
+// NVS "eol_cfg" at boot (loadEolCertification()) and written only at the
+// end of a completed EOL test run (saveEolCertification(), called from
+// eolRunTestSequence() in the [EOL] section).
+const char* eolCertStatusStr() {
+  switch (eolCertState) {
+    case EOL_CERT_PASSED: return "CERTIFIED";
+    case EOL_CERT_FAILED: return "EOL_TEST_FAILED";
+    default:               return "NOT_EOL_TESTED";
+  }
+}
+
+// Loads the last EOL run's result. Called once at boot, before the EOL
+// jumper check, so the EOL report page can also show "previous result"
+// immediately on entry (see eolBuildReportHTML()).
+void loadEolCertification() {
+  prefs.begin("eol_cfg", true);
+  eolCertState = (EolCertState)prefs.getUChar("cert_state", (uint8_t)EOL_CERT_NOT_RUN);
+  prefs.end();
+  Serial.printf("🏭 EOL CERTIFICATION (loaded): %s\n", eolCertStatusStr());
+}
+
+// Persists the result of a completed EOL run. Called ONLY from
+// eolRunTestSequence() — still fully local/offline, no AWS/MQTT dependency,
+// consistent with the rest of EOL mode's independence from connectivity.
+// Reentrant: re-running EOL simply overwrites the previous record, exactly
+// like every other EOL result already worked (no permanent lockout).
+void saveEolCertification(EolCertState state, int failCount) {
+  prefs.begin("eol_cfg", false);
+  prefs.putUChar("cert_state", (uint8_t)state);
+  prefs.putInt("fail_count", failCount);
+  prefs.putString("last_run_ts", getTimestamp());
+  prefs.end();
+  eolCertState = state;
+  Serial.printf("🏭 EOL CERTIFICATION (saved): %s (fail_count=%d)\n", eolCertStatusStr(), failCount);
+}
+
+
+
+
+// ================== [SHADOW] DEVICE SHADOW REPORTED-STATE HELPER ==================
+// Generic reported-state publisher for ALL "state changed" call sites
+// (bypass timeout, emergency replay, and any future state-change event).
+// Caller fills a JsonObject with whatever reported keys changed — AWS IoT
+// shadow does a partial merge on "reported", it does NOT overwrite
+// unmentioned keys. One schema, one code path, everywhere. Shadow reflects
+// CURRENT device state only — never commanded/future/intended state.
+// [SHADOWDIFF] Cache of the last successfully published "reported" values,
+// keyed by field name. Every publishShadowReported() call is now diffed
+// against this cache — only fields whose value actually changed are sent,
+// and if nothing in the call changed, the publish is skipped entirely.
+// Sized generously (640 bytes) since this accumulates every distinct key
+// ever reported across the firmware's lifetime (voltage_status,
+// bypass_active, fault, valve_state, last_event, eol_status, and any
+// future additions), not just one call site's fields.
+StaticJsonDocument<640> shadowLastReported;
+
+void publishShadowReported(JsonObject fields) {
+  if (!mqtt.connected()) return;
+
+  StaticJsonDocument<320> changedDoc;
+  JsonObject changed = changedDoc.to<JsonObject>();
+  bool anyChanged = false;
+
+  for (JsonPair kv : fields) {
+    JsonVariantConst newVal = kv.value();
+    JsonVariantConst oldVal = shadowLastReported[kv.key()];
+    bool same = (!oldVal.isNull()) && (oldVal == newVal);
+    if (!same) {
+      changed[kv.key()] = newVal;
+      shadowLastReported[kv.key()] = newVal;   // update cache with the new value
+      anyChanged = true;
+    }
+  }
+
+  if (!anyChanged) {
+    Serial.println("📤 SHADOW: no changed fields — publish skipped");
+    return;
+  }
+
+  StaticJsonDocument<320> doc;
+  JsonObject state    = doc.createNestedObject("state");
+  JsonObject reported = state.createNestedObject("reported");
+  for (JsonPair kv : changed) reported[kv.key()] = kv.value();
+  String out; serializeJson(doc, out);
+  mqtt.publish(shadowUpdateTopic.c_str(), out.c_str(), false, 1);
+  Serial.print("📤 SHADOW: "); Serial.println(out);
+}
+
+
+
+
+// ================== [EMERGENCY] OFFLINE EMERGENCY ACTION RECORD ==================
+// Survives reboot and arbitrary MQTT/LTE outage length. Written at the moment
+// the firmware autonomously decides to act — BEFORE the motor is commanded —
+// and replayed to the cloud the next time a connection is available. NVS
+// namespace "emergency" — isolated from "device_cfg" since this is a rare,
+// safety-relevant record, not routine config.
+//
+// Design principle: never lose an emergency event. A duplicate report
+// (e.g. from a lost PUBACK triggering a retry of an already-delivered
+// message) is an acceptable tradeoff — it carries the same device_id +
+// trigger_time + reason and is straightforward to recognize/dedupe
+// downstream if the backend is ever enhanced to do so.
+
+void emergencySaveTrigger(const char* reason) {
+  prefs.begin("emergency", false);
+  prefs.putUChar("pending", 1);
+  prefs.putString("reason", reason);
+  prefs.putUChar("mqtt_conn", mqtt.connected() ? 1 : 0);   // connectivity AT TRIGGER
+  prefs.putFloat("valve_pos", totalTurns);
+  prefs.putFloat("battery_v", getVoltage());
+  prefs.putString("trigger_ts", getTimestamp());           // may read "RTC_INVALID"/"RTC_READ_ERR"
+  prefs.end();
+  emergencyPending = true;
+  Serial.printf("💾 EMERGENCY TRIGGER SAVED: reason=%s mqtt=%s v=%.2f pos=%.2f\n",
+                reason, mqtt.connected()?"UP":"DOWN", getVoltage(), totalTurns);
+}
+
+bool emergencyHasPending() {
+  prefs.begin("emergency", true);
+  bool pending = prefs.getUChar("pending", 0) == 1;
+  prefs.end();
+  return pending;
+}
+
+void emergencyClearPending() {
+  prefs.begin("emergency", false);
+  prefs.putUChar("pending", 0);
+  prefs.end();
+  emergencyPending = false;
+  Serial.println("✅ EMERGENCY PENDING CLEARED");
+}
+
+// Called from connectMQTT() right after a successful connection, AND from
+// the FW_ACTIVE periodic retry — a successful mqtt.connect() does not
+// guarantee the first publish() reaches the broker (buffer limits,
+// transient broker issues), so this must be retriable independent of the
+// connect event itself.
+void emergencyPublishIfPending() {
+  if (!emergencyHasPending()) return;
+  if (!mqtt.connected())      return;
+
+  prefs.begin("emergency", true);
+  String reason    = prefs.getString("reason", "UNKNOWN");
+  bool   mqttWasUp = prefs.getUChar("mqtt_conn", 0) == 1;
+  float  valvePos  = prefs.getFloat("valve_pos", totalTurns);
+  float  battV     = prefs.getFloat("battery_v", getVoltage());
+  String trigTs    = prefs.getString("trigger_ts", "");
+  prefs.end();
+
+  StaticJsonDocument<256> doc;
+  doc["device_id"]         = DEVICE_ID;
+  doc["event"]              = "EMERGENCY_AUTO_CLOSE";
+  doc["reason"]              = reason;
+  doc["trigger_time"]       = trigTs;
+  doc["executed_offline"]   = !mqttWasUp;
+  doc["operator_response"]  = false;
+  doc["mqtt_available"]     = mqttWasUp;
+  doc["valve_position"]     = valvePos;
+  doc["battery_voltage"]    = battV;
+  String out; serializeJson(doc, out);
+  bool ok = mqtt.publish(pubEventTopic.c_str(), out.c_str(), false, 1);
+
+  if (ok) {
+    Serial.print("📤 EMERGENCY EVENT: "); Serial.println(out);
+    // [SHADOW] reflect it as current state too, not just an event
+    StaticJsonDocument<192> fields;
+    fields["last_event"]     = "EMERGENCY_AUTO_CLOSE";
+    fields["bypass_active"]  = false;   // the bypass window itself is long over by reconnect
+    fields["voltage_status"] = voltageStatusStr();
+    fields["fault"]          = faultStatusStr();
+    fields["valve_state"]    = valveStateStr();
+    publishShadowReported(fields.as<JsonObject>());
+    emergencyClearPending();
+  } else {
+    Serial.println("⚠️ EMERGENCY EVENT publish failed — retry on next connect/tick");
+    // pending intentionally left set — same fire-and-forget QoS1 pattern
+    // used everywhere else in this firmware; no ack tracking exists yet.
+  }
+}
+
+
+
+
+// ================== [TLS] CREDENTIAL LOADER ==================
+bool loadAndApplyTLSCredentials() {
+  Serial.println("🔐 Loading TLS credentials...");
+  prefs.begin("aws_creds", true);
+  awsEndpoint = prefs.getString("endpoint", "");
+  awsCert     = prefs.getString("cert",     "");
+  awsPkey     = prefs.getString("pkey",     "");
+  awsRootCA   = prefs.getString("rootca",   "");
+  prefs.end();
+  if (awsEndpoint.length()==0){Serial.println("❌ TLS: endpoint missing");    return false;}
+  if (awsCert.length()    ==0){Serial.println("❌ TLS: cert missing");        return false;}
+  if (awsPkey.length()    ==0){Serial.println("❌ TLS: private key missing"); return false;}
+  if (awsRootCA.length()  ==0){Serial.println("❌ TLS: root CA missing");     return false;}
+  gsmClient.setCACert(awsRootCA.c_str()); gsmClient.setCertificate(awsCert.c_str());
+  gsmClient.setPrivateKey(awsPkey.c_str());
+  otaClient.setCACert(awsRootCA.c_str()); otaClient.setCertificate(awsCert.c_str());
+  otaClient.setPrivateKey(awsPkey.c_str());
+  Serial.println("✅ TLS credentials applied");
+  Serial.print("🌐 Endpoint: "); Serial.println(awsEndpoint);
+  return true;
+}
+
+
+
+
+// ================== [I2C-REC] BUS RECOVERY ==================
+void recoverI2C() {
+  Serial.println("🔧 I2C RECOVERY");
+  pinMode(SDA_PIN, INPUT_PULLUP); pinMode(SCL_PIN, OUTPUT);
+  for (int i=0; i<9; i++) {
+    digitalWrite(SCL_PIN, HIGH); delayMicroseconds(5);
+    digitalWrite(SCL_PIN, LOW);  delayMicroseconds(5);
+    if (digitalRead(SDA_PIN)==HIGH) { Serial.printf("✅ SDA released after %d pulses\n",i+1); break; }
+  }
+  pinMode(SDA_PIN, OUTPUT);
+  digitalWrite(SDA_PIN, LOW);  delayMicroseconds(5);
+  digitalWrite(SCL_PIN, HIGH); delayMicroseconds(5);
+  digitalWrite(SDA_PIN, HIGH); delayMicroseconds(5);
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Serial.println("🔧 I2C reinitialised");
+}
+
+
+
+
+// ================== [SENSOR] HEALTH CHECK ==================
+String checkINA226str() {
+  if (inaAddr==0x00) return "NO_ADDR";
+  if (!i2cAck(inaAddr)) return "NO_ACK";
+  if (!validateINA226(inaAddr)) return "BAD_ID";
+  return "OK";
+}
+
+String checkAS5600str() {
+  if (encAddr==0x00) return "NO_ADDR";
+  if (!i2cAck(encAddr)) return "NO_ACK";
+  Wire.beginTransmission(encAddr); Wire.write(0x0B);
+  if (Wire.endTransmission(false)!=0) return "NO_ACK";
+  Wire.requestFrom(encAddr,(uint8_t)1);
+  if (!Wire.available()) return "NO_ACK";
+  uint8_t status=Wire.read();
+  if (!(status&0x20)) return "NO_MAGNET";
+  Wire.beginTransmission(encAddr); Wire.write(0x1A);
+  if (Wire.endTransmission(false)!=0) return "NO_ACK";
+  Wire.requestFrom(encAddr,(uint8_t)1);
+  if (!Wire.available()) return "NO_ACK";
+  uint8_t agc=Wire.read();
+  if (agc==0||agc==255) return "AGC_SAT";
+  return "OK";
+}
+
+bool checkSensors() {
+  String inaResult=checkINA226str(), encResult=checkAS5600str();
+  Serial.printf("🔬 INA226@0x%02X:%s  AS5600@0x%02X:%s\n",
+                inaAddr,inaResult.c_str(),encAddr,encResult.c_str());
+
+  bool inaNoAck=(inaResult=="NO_ACK"||inaResult=="NO_ADDR");
+  bool encNoAck=(encResult=="NO_ACK"||encResult=="NO_ADDR");
+  if (inaNoAck) inaFailCount++; else inaFailCount=0;
+  if (encNoAck) encFailCount++; else encFailCount=0;
+
+  if (inaFailCount>=2 || encFailCount>=2) {
+    Serial.println("⚠️ CONSECUTIVE NO_ACK — I2C recovery");
+    recoverI2C();
+    bool redetected=detectHardware();
+    inaFailCount=0; encFailCount=0;
+    if (redetected && ina226!=nullptr)
+      { delete ina226; ina226=new INA226_WE(inaAddr); ina226->init(); configureINAAlert(); }
+    inaResult=checkINA226str(); encResult=checkAS5600str();
+    bool recovered=(inaResult=="OK"&&encResult=="OK");
+    if (!recovered) {
+      i2cRecoveryCount++;   // [WDT] count consecutive recovery failures
+      Serial.printf("🔴 I2C RECOVERY FAILED (%d/%d)\n", i2cRecoveryCount, I2C_RECOVERY_RESET_THRESHOLD);
+      if (i2cRecoveryCount >= I2C_RECOVERY_RESET_THRESHOLD) {
+        Serial.println("🔴 I2C RECOVERY THRESHOLD — ESP.restart()");
+        if (mqtt.connected()) {
+          StaticJsonDocument<96> e; e["device_id"]=DEVICE_ID; e["event"]="I2C_HARD_RESET";
+          String o; serializeJson(e,o); mqtt.publish(pubStatusTopic.c_str(),o.c_str(),false,1); delay(200);
+        }
+        ESP.restart();
+      }
+      if (!i2cFault) {
+        i2cFault=true;
+        if (mqtt.connected()) {
+          StaticJsonDocument<160> doc;
+          doc["device_id"]=DEVICE_ID; doc["i2c_event"]="I2C_RECOVERY_FAIL";
+          doc["ina226"]=inaResult; doc["as5600"]=encResult;
+          String out; serializeJson(doc,out);
+          mqtt.publish(pubStatusTopic.c_str(),out.c_str(),false,1);
+        }
+      }
+    } else {
+      i2cRecoveryCount=0;
+      if (i2cFault) {
+        i2cFault=false; publishHWProfile();
+        if (mqtt.connected()) {
+          StaticJsonDocument<96> doc; doc["device_id"]=DEVICE_ID; doc["i2c_event"]="I2C_RECOVERED";
+          String out; serializeJson(doc,out); mqtt.publish(pubStatusTopic.c_str(),out.c_str(),false,1);
+        }
+      }
+    }
+  } else if (i2cFault&&inaResult=="OK"&&encResult=="OK") {
+    i2cFault=false; i2cRecoveryCount=0;
+    if (mqtt.connected()) {
+      StaticJsonDocument<96> doc; doc["device_id"]=DEVICE_ID; doc["i2c_event"]="I2C_RECOVERED";
+      String out; serializeJson(doc,out); mqtt.publish(pubStatusTopic.c_str(),out.c_str(),false,1);
+    }
+  }
+
+  if (mqtt.connected()) {
+    StaticJsonDocument<192> doc;
+    doc["device_id"]=DEVICE_ID; doc["ina226"]=inaResult; doc["as5600"]=encResult;
+    char buf[8];
+    snprintf(buf,sizeof(buf),"0x%02X",inaAddr); doc["ina_addr"]=String(buf);
+    snprintf(buf,sizeof(buf),"0x%02X",encAddr); doc["enc_addr"]=String(buf);
+    String out; serializeJson(doc,out);
+    mqtt.publish(pubStatusTopic.c_str(),out.c_str(),false,1);
+  }
+  return (inaResult=="OK"&&encResult=="OK");
+}
+
+
+
+
+// ================== [INA ALERT] ==================
+void configureINAAlert() {
+  if (inaAddr==0x00) return;
+  uint16_t alertLimit=(uint16_t)((CURRENT_OFF*1000.0*10.0)/2.5);
+  Wire.beginTransmission(inaAddr); Wire.write(0x07);
+  Wire.write((alertLimit>>8)&0xFF); Wire.write(alertLimit&0xFF); Wire.endTransmission();
+  Wire.beginTransmission(inaAddr); Wire.write(0x06);
+  Wire.write(0x80); Wire.write(0x00); Wire.endTransmission();
+  Serial.printf("⚡ INA226@0x%02X alert: %.2fA\n",inaAddr,CURRENT_OFF);
+}
+
+
+
+
+// ================== [POS] STORAGE ==================
+void savePosition() {
+  prefs.begin("encoder", false);
+  prefs.putLong("rot", rotationCount);
+  prefs.putInt("angle", angle);
+  prefs.putBool("pos_conf", true);
+  prefs.end();
+  positionConfident=true;
+  Serial.println("💾 POSITION SAVED (confidence HIGH)");
+}
+
+void loadPosition() {
+  prefs.begin("encoder", true);
+  rotationCount     = prefs.getLong("rot", 0);
+  angle             = prefs.getInt("angle", 0);
+  positionConfident = prefs.getBool("pos_conf", false);
+  prefs.end();
+  prevAngle  = angle;
+  totalTurns = rotationCount + (angle / 4096.0);
+  if (positionConfident)
+    Serial.printf("📂 POSITION: %.2f turns (HIGH confidence)\n", totalTurns);
+  else
+    Serial.printf("⚠️ POSITION: %.2f turns (LOW confidence — send CALIBRATE_CLOSED or CONFIRM_POSITION)\n", totalTurns);
+}
+
+
+
+
+// ================== [CAL] FIELD CALIBRATION STATE MACHINE ==================
+//
+// CalState persisted in NVS "device_cfg" / "cal_state" so a power loss
+// mid-sequence is detected on the next boot and the motor is blocked until
+// the operator restarts or cancels calibration.
+//
+// CAL_IDLE            → normal operation
+// CAL_AWAITING_CLOSED → 1st CALIBRATE_CLOSED received; operator driving to closed stop
+// CAL_CLOSED_SET      → 2nd CALIBRATE_CLOSED received; closed zero recorded;
+//                        operator driving to open stop
+//
+// Transitions to CAL_COMPLETE are transient — state immediately returns to
+// CAL_IDLE after saving to NVS and publishing CAL_COMPLETE.
+
+enum CalState { CAL_IDLE, CAL_AWAITING_CLOSED, CAL_CLOSED_SET };
+CalState calState = CAL_IDLE;
+
+unsigned long calStartMs = 0;   // timestamp of CALIBRATE_CLOSED (1st send)
+
+void saveCalState(CalState s) {
+  prefs.begin("device_cfg", false);
+  prefs.putUChar("cal_state", (uint8_t)s);
+  prefs.end();
+}
+
+void loadCalState() {
+  prefs.begin("device_cfg", true);
+  calState = (CalState)prefs.getUChar("cal_state", (uint8_t)CAL_IDLE);
+  prefs.end();
+  if (calState != CAL_IDLE) {
+    Serial.printf("⚠️ CAL STATE ON BOOT: %s — motor blocked until CALIBRATE_CLOSED or CALIBRATE_CANCEL\n",
+                  calState == CAL_AWAITING_CLOSED ? "CAL_AWAITING_CLOSED" : "CAL_CLOSED_SET");
+  }
+}
+
+// Returns true if calibration is in progress (motor block condition)
+bool calInProgress() { return calState != CAL_IDLE; }
+
+// Publish calibration incomplete warning — called on MQTT connect if cal was
+// interrupted by a reboot between the two CALIBRATE_CLOSED sends or before
+// CALIBRATE_OPEN was received.
+void publishCalIncomplete() {
+  if (!mqtt.connected()) return;
+  StaticJsonDocument<192> doc;
+  doc["device_id"] = DEVICE_ID;
+  doc["cal_event"] = "CAL_INCOMPLETE";
+  doc["cal_state"] = calState == CAL_AWAITING_CLOSED ? "AWAITING_CLOSED" : "CLOSED_SET";
+  doc["ts"]        = getTimestamp();
+  doc["action"]    = "Send CALIBRATE_CLOSED to restart or CALIBRATE_CANCEL to abort";
+  String out; serializeJson(doc, out);
+  mqtt.publish(pubStatusTopic.c_str(), out.c_str(), false, 1);
+  Serial.println("⚠️ CAL_INCOMPLETE published");
+}
+
+// ── CALIBRATE_CLOSED handler ──────────────────────────────────────────────
+// First call:  enter CAL_AWAITING_CLOSED, inform operator to drive to closed stop
+// Second call: record closed position as zero, advance to CAL_CLOSED_SET
+void handleCalClosed() {
+  if (motorState != IDLE || rampState != RAMP_IDLE) {
+    Serial.println("❌ CALIBRATE_CLOSED blocked — motor running");
+    if (mqtt.connected()) {
+      StaticJsonDocument<128> doc;
+      doc["device_id"] = DEVICE_ID; doc["cal_event"] = "CAL_BLOCKED";
+      doc["reason"] = "MOTOR_RUNNING"; doc["ts"] = getTimestamp();
+      String out; serializeJson(doc, out);
+      mqtt.publish(pubStatusTopic.c_str(), out.c_str(), false, 1);
+    }
+    return;
+  }
+
+  if (calState == CAL_IDLE) {
+    // ── First send: enter calibration mode ──
+    calState   = CAL_AWAITING_CLOSED;
+    calStartMs = millis();
+    saveCalState(calState);
+    Serial.println("📐 CAL: entered CAL_AWAITING_CLOSED — drive valve to fully closed, then send CALIBRATE_CLOSED again");
+    if (mqtt.connected()) {
+      StaticJsonDocument<160> doc;
+      doc["device_id"] = DEVICE_ID; doc["cal_event"] = "CAL_AWAITING_CLOSED";
+      doc["ts"]        = getTimestamp();
+      doc["action"]    = "Drive valve to fully closed stop, then send CALIBRATE_CLOSED again";
+      String out; serializeJson(doc, out);
+      mqtt.publish(pubStatusTopic.c_str(), out.c_str(), false, 1);
+    }
+    return;
+  }
+
+  if (calState == CAL_AWAITING_CLOSED) {
+    // ── Second send: record closed position as zero ──
+    // Back up current MAX_TURNS before overwriting, so CALIBRATE_CANCEL can restore it
+    prefs.begin("device_cfg", false);
+    prefs.putFloat("max_turns_bak", MAX_TURNS);
+    prefs.putFloat("min_turns_bak", MIN_TURNS);
+    prefs.end();
+
+    // Zero encoder at current physical position (closed stop)
+    rotationCount = 0;
+    totalTurns    = 0;
+    MIN_TURNS     = 0.0f;
+    // angle/prevAngle preserved — diff calculation stays continuous
+    savePosition();   // saves with HIGH confidence + pos_conf=true
+
+    prefs.begin("device_cfg", false);
+    prefs.putFloat("min_turns", MIN_TURNS);
+    prefs.end();
+
+    calState = CAL_CLOSED_SET;
+    saveCalState(calState);
+
+    Serial.println("📐 CAL: closed stop recorded — totalTurns=0, MIN_TURNS=0");
+    Serial.println("📐 CAL: drive valve to fully open, then send CALIBRATE_OPEN");
+
+    if (mqtt.connected()) {
+      StaticJsonDocument<160> doc;
+      doc["device_id"] = DEVICE_ID; doc["cal_event"] = "CAL_CLOSED_SET";
+      doc["turns"]     = totalTurns; doc["min_turns"] = MIN_TURNS;
+      doc["ts"]        = getTimestamp();
+      doc["action"]    = "Drive valve to fully open stop, then send CALIBRATE_OPEN";
+      String out; serializeJson(doc, out);
+      mqtt.publish(pubStatusTopic.c_str(), out.c_str(), false, 1);
+    }
+    return;
+  }
+
+  // calState == CAL_CLOSED_SET — operator may have sent CALIBRATE_CLOSED by mistake
+  // Inform them to send CALIBRATE_OPEN instead
+  Serial.println("⚠️ CAL: closed already set — send CALIBRATE_OPEN or CALIBRATE_CANCEL");
+  if (mqtt.connected()) {
+    StaticJsonDocument<160> doc;
+    doc["device_id"] = DEVICE_ID; doc["cal_event"] = "CAL_ALREADY_CLOSED";
+    doc["ts"]        = getTimestamp();
+    doc["action"]    = "Send CALIBRATE_OPEN to record open stop, or CALIBRATE_CANCEL to abort";
+    String out; serializeJson(doc, out);
+    mqtt.publish(pubStatusTopic.c_str(), out.c_str(), false, 1);
+  }
+}
+
+// ── CALIBRATE_OPEN handler ────────────────────────────────────────────────
+// Only valid in CAL_CLOSED_SET state.
+// Records current totalTurns as MAX_TURNS, completes calibration.
+void handleCalOpen() {
+  if (calState != CAL_CLOSED_SET) {
+    Serial.println("❌ CALIBRATE_OPEN rejected — send CALIBRATE_CLOSED first");
+    if (mqtt.connected()) {
+      StaticJsonDocument<128> doc;
+      doc["device_id"] = DEVICE_ID; doc["cal_event"] = "CAL_OPEN_REJECTED";
+      doc["reason"]    = "CLOSED_NOT_SET"; doc["ts"] = getTimestamp();
+      String out; serializeJson(doc, out);
+      mqtt.publish(pubStatusTopic.c_str(), out.c_str(), false, 1);
+    }
+    return;
+  }
+
+  if (motorState != IDLE || rampState != RAMP_IDLE) {
+    Serial.println("❌ CALIBRATE_OPEN blocked — motor running");
+    if (mqtt.connected()) {
+      StaticJsonDocument<128> doc;
+      doc["device_id"] = DEVICE_ID; doc["cal_event"] = "CAL_BLOCKED";
+      doc["reason"]    = "MOTOR_RUNNING"; doc["ts"] = getTimestamp();
+      String out; serializeJson(doc, out);
+      mqtt.publish(pubStatusTopic.c_str(), out.c_str(), false, 1);
+    }
+    return;
+  }
+
+  if (totalTurns < 0.5f) {
+    // Sanity check: open position must be meaningfully different from closed.
+    // Less than half a turn suggests the operator sent CALIBRATE_OPEN without
+    // actually driving the valve open — reject to prevent a zero-range cal.
+    Serial.printf("❌ CALIBRATE_OPEN rejected — totalTurns=%.2f too small (drive valve open first)\n", totalTurns);
+    if (mqtt.connected()) {
+      StaticJsonDocument<128> doc;
+      doc["device_id"] = DEVICE_ID; doc["cal_event"] = "CAL_OPEN_REJECTED";
+      doc["reason"]    = "TURNS_TOO_SMALL"; doc["turns"] = totalTurns; doc["ts"] = getTimestamp();
+      String out; serializeJson(doc, out);
+      mqtt.publish(pubStatusTopic.c_str(), out.c_str(), false, 1);
+    }
+    return;
+  }
+
+  // Record open stop
+  unsigned long durationMs = millis() - calStartMs;
+  MAX_TURNS = totalTurns;
+  MIN_TURNS = 0.0f;
+  positionConfident = true;
+
+  // Save all calibration results to NVS
+  prefs.begin("device_cfg", false);
+  prefs.putFloat("max_turns", MAX_TURNS);
+  prefs.putFloat("min_turns", MIN_TURNS);
+  prefs.putUChar("cal_state", (uint8_t)CAL_IDLE);   // clear cal_state
+  prefs.end();
+  savePosition();   // saves turns + pos_conf=HIGH
+
+  calState = CAL_IDLE;
+
+  Serial.printf("✅ CAL COMPLETE — closed:0.00 open:%.2f turns, duration:%lums\n",
+                MAX_TURNS, durationMs);
+
+  if (mqtt.connected()) {
+    StaticJsonDocument<192> doc;
+    doc["device_id"]   = DEVICE_ID; doc["cal_event"] = "CAL_COMPLETE";
+    doc["closed_turns"] = 0.0f;     doc["open_turns"] = MAX_TURNS;
+    doc["min_turns"]   = MIN_TURNS; doc["duration_ms"] = durationMs;
+    doc["ts"]          = getTimestamp();
+    String out; serializeJson(doc, out);
+    mqtt.publish(pubStatusTopic.c_str(), out.c_str(), false, 1);
+  }
+
+  publishFullStatus();
+}
+
+// ── CALIBRATE_CANCEL handler ──────────────────────────────────────────────
+// Restores previous MAX_TURNS and MIN_TURNS from NVS backup.
+// If cancel happens after CAL_CLOSED_SET (zero was already written),
+// the encoder zero is NOT restored — position is now uncertain.
+// Operator must send CONFIRM_POSITION or redo calibration.
+void handleCalCancel() {
+  if (calState == CAL_IDLE) {
+    Serial.println("⚠️ CALIBRATE_CANCEL — no calibration in progress");
+    return;
+  }
+
+  bool zeroWasWritten = (calState == CAL_CLOSED_SET);
+
+  // Restore backed-up endpoints
+  prefs.begin("device_cfg", true);
+  float bakMax = prefs.getFloat("max_turns_bak", MAX_TURNS);
+  float bakMin = prefs.getFloat("min_turns_bak", MIN_TURNS);
+  prefs.end();
+
+  MAX_TURNS = bakMax;
+  MIN_TURNS = bakMin;
+
+  prefs.begin("device_cfg", false);
+  prefs.putFloat("max_turns", MAX_TURNS);
+  prefs.putFloat("min_turns", MIN_TURNS);
+  prefs.putUChar("cal_state", (uint8_t)CAL_IDLE);
+  prefs.end();
+
+  calState = CAL_IDLE;
+
+  if (zeroWasWritten) {
+    // Closed zero was recorded — current position is now unknown relative
+    // to the restored MAX_TURNS. Mark as uncertain.
+    setPositionConfidence(false);
+    Serial.println("⚠️ CAL CANCELLED after zero written — position uncertain");
+    Serial.println("   Send CONFIRM_POSITION to accept current position, or redo calibration");
+  } else {
+    Serial.println("✅ CAL CANCELLED — previous endpoints restored, position unchanged");
+  }
+
+  if (mqtt.connected()) {
+    StaticJsonDocument<192> doc;
+    doc["device_id"]   = DEVICE_ID; doc["cal_event"] = "CAL_CANCELLED";
+    doc["max_turns"]   = MAX_TURNS; doc["min_turns"]  = MIN_TURNS;
+    doc["pos_confident"] = positionConfident; doc["ts"] = getTimestamp();
+    if (zeroWasWritten) doc["warning"] = "Position uncertain — send CONFIRM_POSITION or recalibrate";
+    String out; serializeJson(doc, out);
+    mqtt.publish(pubStatusTopic.c_str(), out.c_str(), false, 1);
+  }
+}
+
+
+
+
+// ================== [DEVSTATE] DEVICE STATE SNAPSHOT (Step 1 — additive only) ==================
+//
+// This is step 1 of a planned multi-step migration toward a single source
+// of truth for device state. IT DOES NOT REPLACE ANYTHING. Every field
+// below is a READ-ONLY MIRROR of an existing global, refreshed only by
+// explicitly calling syncDeviceState() — nothing calls that function
+// automatically yet, and no existing read/write site anywhere in this
+// file has been touched. Behavior is byte-for-byte identical to v1.1.2.
+//
+// Migration path (this commit is ONLY step 1):
+//   Step 1 (this commit) — struct + sync function exist, mirror the
+//     existing globals, used nowhere that affects behavior.
+//   Step 2 (future, one module at a time, bench-verified between each) —
+//     individual call sites migrated to read FROM deviceState instead of
+//     the raw global, module by module (fault flags first, then motor/
+//     position, then connectivity, etc.), never all at once.
+//   Step 3 (future) — once nothing reads the raw globals directly outside
+//     their own owning section, those globals become private/static to
+//     that section and deviceState becomes the only public interface.
+//
+// Why additive-first: collapsing every safety-relevant global (position
+// confidence, fault flags, voltage state) into one struct in a single pass
+// would touch every guard condition in the firmware simultaneously, with
+// no way to verify each change in isolation on hardware. This step carries
+// zero behavioral risk because nothing existing depends on it yet.
+struct DeviceState {
+  // Motor / position
+  State  motorState;
+  float  totalTurns;
+  float  minTurns;
+  float  maxTurns;
+  bool   positionConfident;
+
+  // Calibration
+  CalState calState;
+
+  // Voltage / safety
+  VoltageState voltageState;
+  bool   lockFault;
+  bool   i2cFault;
+  bool   encFault;
+
+  // Emergency
+  bool   emergencyPending;
+
+  // Connectivity
+  bool   lteReady;
+  bool   mqttConnected;
+
+  // EOL certification
+  EolCertState eolCertState;
+
+  // Brownout (informational only — see [BROWNOUT] section)
+  bool   bootWasBrownout;
+};
+
+DeviceState deviceState;   // zero-initialized; first real values arrive via syncDeviceState()
+
+// Refreshes the snapshot from the existing globals. Deliberately NOT called
+// automatically anywhere yet — call sites that want a fresh snapshot must
+// call this explicitly first. This cannot alter existing behavior: it only
+// reads existing globals and writes to deviceState, which nothing existing
+// reads from.
+void syncDeviceState() {
+  deviceState.motorState        = motorState;
+  deviceState.totalTurns        = totalTurns;
+  deviceState.minTurns          = MIN_TURNS;
+  deviceState.maxTurns          = MAX_TURNS;
+  deviceState.positionConfident = positionConfident;
+  deviceState.calState          = calState;
+  deviceState.voltageState      = vState;
+  deviceState.lockFault         = lockFault;
+  deviceState.i2cFault          = i2cFault;
+  deviceState.encFault          = encFault;
+  deviceState.emergencyPending  = emergencyPending;
+  deviceState.lteReady          = lteReady;
+  deviceState.mqttConnected     = mqtt.connected();
+  deviceState.eolCertState      = eolCertState;
+  deviceState.bootWasBrownout   = bootWasBrownout;
+}
+
+
+
+
+// ================== RETRY ==================
+bool isRetryActive() { return (retryCount>0&&retryCount<3&&!lockFault); }
+
+
+
+
+// ================== [RAMP] NON-BLOCKING RAMP HANDLER ==================
+void handleMotorRamp() {
+  if (rampState==RAMP_IDLE||rampState==RAMP_RUNNING) return;
+  unsigned long now=millis();
+  switch (rampState) {
+    case RAMP_UP:
+      if (now-rampTimer>=RAMP_STEP_MS) {
+        rampTimer=now; rampDuty+=3; if (rampDuty>255) rampDuty=255;
+        ledcWrite(PWM_PIN,rampDuty);
+        if (rampDuty>=255){rampSettle=now;rampState=RAMP_BYPASS;}
+      } break;
+    case RAMP_BYPASS:
+      if (now-rampSettle>=RAMP_SETTLE_MS) {
+        digitalWrite(RELAY_PWR,RELAY_ON); ledcWrite(PWM_PIN,255);
+        motorState=rampDir; lastDirection=rampDir; rampState=RAMP_RUNNING;
+        Serial.println("⚡ BYPASS ON — RUNNING");
+
+        // [SHADOW] motorState is now genuinely REVERSE_RUN (or FORWARD_RUN) —
+        // valveStateStr() reads current state only. Publish exactly here so
+        // the shadow never claims "CLOSING" before it's actually true.
+        if (bypassTimeoutClosePending) {
+          bypassTimeoutClosePending = false;
+          StaticJsonDocument<192> fields;
+          fields["voltage_status"] = voltageStatusStr();   // "BYPASS_ACTIVE"
+          fields["bypass_active"]  = true;
+          fields["fault"]          = faultStatusStr();
+          fields["valve_state"]    = valveStateStr();       // "CLOSING" — true at publish time
+          fields["last_event"]     = "BYPASS_TIMEOUT";
+          publishShadowReported(fields.as<JsonObject>());
+        }
+      } break;
+    case RAMP_DOWN_INIT:
+      digitalWrite(RELAY_PWR,RELAY_OFF);
+      rampDuty=255; ledcWrite(PWM_PIN,rampDuty); rampTimer=now; rampState=RAMP_DOWN;
+      Serial.println("🔽 SOFT STOP"); break;
+    case RAMP_DOWN:
+      if (now-rampTimer>=RAMP_STEP_MS) {
+        rampTimer=now; rampDuty-=3; if (rampDuty<0) rampDuty=0;
+        ledcWrite(PWM_PIN,rampDuty);
+        if (rampDuty<=0){ledcWrite(PWM_PIN,0);rampState=RAMP_DONE;}
+      } break;
+    case RAMP_DONE:
+      digitalWrite(RELAY_FWD,RELAY_OFF); digitalWrite(RELAY_REV,RELAY_OFF);
+      ledcWrite(PWM_PIN,0); rampState=RAMP_IDLE; motorState=IDLE;
+      savePosition(); publishPosition(resumeDirection);
+      Serial.println("🛑 STOPPED — IDLE"); break;
+    default: break;
+  }
+}
+
+
+
+
+// ================== MOTOR ==================
+void clearRelays() {
+  ledcWrite(PWM_PIN,0);
+  digitalWrite(RELAY_PWR,RELAY_OFF);
+  digitalWrite(RELAY_FWD,RELAY_OFF);
+  digitalWrite(RELAY_REV,RELAY_OFF);
+}
+
+void stopMotor() {
+  State stoppedFrom=motorState;
+  if (motorState!=IDLE) {
+    resumeDirection=motorState; resumePending=true;
+    if (rampState==RAMP_UP||rampState==RAMP_BYPASS)
+      { clearRelays(); rampState=RAMP_IDLE; motorState=IDLE; savePosition(); publishPosition(stoppedFrom); return; }
+    rampState=RAMP_DOWN_INIT; return;
+  }
+  clearRelays(); rampState=RAMP_IDLE;
+}
+
+// [BYPASS] Now returns bool: true if the ramp was actually started, false if
+// a safety guard rejected the command. Callers that need to know whether the
+// motor genuinely started (e.g. the emergency auto-close path) can check
+// this instead of duplicating the guard conditions themselves.
+bool startMotor(State dir) {
+  if (vState  ==LOCKED)      { Serial.println("🔒 BATTERY LOCKED");     return false; }
+  if (lockFault)              { Serial.println("🔒 CURRENT LOCKED");     return false; }
+  if (i2cFault)               { Serial.println("🔒 I2C FAULT");          return false; }
+  if (encFault)               { Serial.println("🔒 ENC FAULT");          return false; }
+  if (!positionConfident && !calInProgress()) { Serial.println("🔒 POSITION UNCERTAIN"); return false; }
+  if (!limitOverride&&dir==REVERSE_RUN&&totalTurns<=MIN_TURNS) { Serial.println("⛔ REVERSE BLOCKED"); return false; }
+  if (!limitOverride&&dir==FORWARD_RUN&&totalTurns>=MAX_TURNS) { Serial.println("⛔ FORWARD BLOCKED"); return false; }
+  setPositionConfidence(false);
+  clearRelays();
+  rampDuty=0; rampDir=dir; rampTimer=millis()+200;
+  if (dir==FORWARD_RUN){ digitalWrite(RELAY_REV,RELAY_OFF); digitalWrite(RELAY_FWD,RELAY_ON); }
+  else                 { digitalWrite(RELAY_FWD,RELAY_OFF); digitalWrite(RELAY_REV,RELAY_ON); }
+  rampState=RAMP_UP;
+  Serial.println("🔼 SOFT START");
+  return true;
+}
+
+
+
+
+// ================== [QOS1] MQTT PUBLISH WRAPPER ==================
+bool mqttPublish(const char* topic, const String& payload) {
+  if (!mqtt.connected()){Serial.println("⚠️ MQTT not connected");return false;}
+  return mqtt.publish(topic, payload.c_str(), false, 1);
+}
+
+
+
+
+// ================== MQTT PUBLISH FUNCTIONS ==================
+void publishHWProfile() {
+  if (!mqtt.connected()) return;
+  StaticJsonDocument<192> doc;
+  doc["device_id"]=DEVICE_ID; doc["event"]="HW_PROFILE";
+  char buf[8]; JsonObject hw=doc.createNestedObject("hw_profile");
+  snprintf(buf,sizeof(buf),"0x%02X",inaAddr); hw["ina_addr"]=String(buf);
+  snprintf(buf,sizeof(buf),"0x%02X",encAddr); hw["enc_addr"]=String(buf);
+  snprintf(buf,sizeof(buf),"0x%02X",rtcAddr); hw["rtc_addr"]=String(buf);
+  doc["ts"]=getTimestamp();
+  String out; serializeJson(doc,out);
+  mqtt.publish(pubStatusTopic.c_str(),out.c_str(),false,1);
+  Serial.print("📤 HW PROFILE: "); Serial.println(out);
+}
+
+void publishPosition(State stoppedFrom) {
+  StaticJsonDocument<224> doc;
+  doc["device_id"]=DEVICE_ID; doc["turns"]=totalTurns; doc["state"]="IDLE";
+  doc["pos_confident"]=positionConfident; doc["ts"]=getTimestamp();
+  if      (stoppedFrom==FORWARD_RUN) doc["stopped_from"]="FORWARD";
+  else if (stoppedFrom==REVERSE_RUN) doc["stopped_from"]="REVERSE";
+  else                                doc["stopped_from"]="IDLE";
+  String out; serializeJson(doc,out); mqttPublish(pubStatusTopic.c_str(),out);
+  Serial.print("📤 POS: "); Serial.println(out);
+}
+
+void publishVoltageEvent(String event, float v) {
+  StaticJsonDocument<160> doc;
+  doc["device_id"]=DEVICE_ID; doc["voltage_event"]=event;
+  doc["voltage_v"]=v; doc["ts"]=getTimestamp();
+  String out; serializeJson(doc,out); mqttPublish(pubEventTopic.c_str(),out);
+}
+
+void publishCurrentEvent(String event, float current) {
+  StaticJsonDocument<160> doc;
+  doc["device_id"]=DEVICE_ID; doc["current_event"]=event;
+  doc["current_a"]=current; doc["threshold_a"]=CURRENT_OFF;
+  doc["retry"]=retryCount; doc["ts"]=getTimestamp();
+  String out; serializeJson(doc,out); mqttPublish(pubEventTopic.c_str(),out);
+}
+
+void publishFullStatus() {
+  syncDeviceState();   // [DEVSTATE] Step 1 exercise only — refreshes the mirror;
+                        // every field below still reads the raw globals, unchanged.
+  StaticJsonDocument<576> doc;
+  doc["device_id"]=DEVICE_ID; doc["fw_version"]=FW_VERSION; doc["fw_type"]=FW_TYPE;
+  if      (motorState==IDLE)        doc["state"]="IDLE";
+  else if (motorState==FORWARD_RUN) doc["state"]="FORWARD";
+  else                              doc["state"]="REVERSE";
+  doc["turns"]=totalTurns; doc["max_turns"]=MAX_TURNS; doc["min_turns"]=MIN_TURNS;
+  doc["ts"]=getTimestamp(); doc["rtc_valid"]=rtcIsValid();
+  doc["pos_confident"]=positionConfident;
+  doc["apn"]=apn;   // [APN]
+  doc["sleep_timeout_ms"]=sleepTimeoutMs;   // [SLP]
+  doc["voltage_status"] = voltageStatusStr();   // [STATUS] shared mapper
+  doc["vbat_raw_mv"]=vbatMV; doc["oc_threshold"]=CURRENT_OFF; doc["retry"]=retryCount;
+  doc["fault"] = faultStatusStr();   // [STATUS] shared mapper
+  doc["eol_status"] = eolCertStatusStr();   // [EOLCERT] shared mapper
+  // [CAL] calibration state in every status payload
+  const char* calStateStr[] = {"CAL_IDLE","CAL_AWAITING_CLOSED","CAL_CLOSED_SET"};
+  doc["cal_state"] = calStateStr[calState];
+  char buf[8]; JsonObject hw=doc.createNestedObject("hw_profile");
+  snprintf(buf,sizeof(buf),"0x%02X",inaAddr); hw["ina_addr"]=String(buf);
+  snprintf(buf,sizeof(buf),"0x%02X",encAddr); hw["enc_addr"]=String(buf);
+  snprintf(buf,sizeof(buf),"0x%02X",rtcAddr); hw["rtc_addr"]=String(buf);
+  if (updateAvailable){doc["update_available"]=true;doc["update_version"]=pendingUpdateVer;}
+  String out; serializeJson(doc,out); mqttPublish(pubStatusTopic.c_str(),out);
+  Serial.print("📤 STATUS: "); Serial.println(out);
+}
+
+
+
+
+const char* lteStateStr() {
+  switch (lteState) {
+    case LTE_AT:       return "AT";
+    case LTE_CPIN:     return "CPIN";
+    case LTE_CSQ:      return "CSQ";
+    case LTE_CREG:     return "CREG";
+    case LTE_CGATT:    return "CGATT";
+    case LTE_CGDCONT:  return "CGDCONT";
+    case LTE_CGACT:    return "CGACT";
+    case LTE_CGPADDR:  return "CGPADDR";
+    case LTE_PING:     return "PING";
+    case LTE_DONE:     return "DONE";
+    default:           return "UNKNOWN";
+  }
+}
+
+const char* resetReasonStr(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "POWERON";
+    case ESP_RST_EXT:       return "EXT_PIN";
+    case ESP_RST_SW:        return "SW_RESTART";
+    case ESP_RST_PANIC:     return "PANIC";
+    case ESP_RST_INT_WDT:   return "INT_WDT";
+    case ESP_RST_TASK_WDT:  return "TASK_WDT";
+    case ESP_RST_WDT:       return "OTHER_WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP_WAKE";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "UNKNOWN";
+  }
+}
+
+// [DIAG] Service/engineering view — distinct from publishFullStatus(), which
+// stays focused on operator-facing state (valve, position, voltage, fault,
+// cal, EOL). This is for troubleshooting: memory, LTE/MQTT internals,
+// sensor health detail, RTC, reset reason. Published ONLY on request
+// (GET_DIAGNOSTICS), never on a timer or automatically.
+//
+// Deliberately does NOT re-probe the modem live (no modemIsAlive() call
+// here) — that sends a blocking AT command over SerialAT, which could
+// collide with an in-flight LTE init/AT exchange if diagnostics happens to
+// be requested mid-connection. Instead this reports the firmware's own
+// tracked LTE state (lteReady/lteState), which is always safe to read.
+void publishDiagnostics() {
+  syncDeviceState();   // [DEVSTATE] Step 1 exercise only — refreshes the mirror;
+                        // every field below still reads the raw globals, unchanged.
+  StaticJsonDocument<640> doc;
+  doc["device_id"]   = DEVICE_ID;
+  doc["fw_version"]  = FW_VERSION;
+  doc["ts"]          = getTimestamp();
+  doc["uptime_ms"]   = millis();
+  doc["reset_reason"]= resetReasonStr(bootResetReason);   // [BROWNOUT] cached at boot
+
+  JsonObject mem = doc.createNestedObject("memory");
+  mem["free_heap"]     = ESP.getFreeHeap();
+  mem["min_free_heap"] = ESP.getMinFreeHeap();
+  mem["heap_size"]     = ESP.getHeapSize();
+
+  JsonObject lte = doc.createNestedObject("lte");
+  lte["ready"]     = lteReady;
+  lte["state"]     = lteStateStr();
+  lte["reg_tries"] = lteRegTries;
+  lte["apn"]       = apn;
+
+  JsonObject mqttObj = doc.createNestedObject("mqtt");
+  mqttObj["connected"] = mqtt.connected();
+  mqttObj["state"]     = mqtt.state();   // PubSubClient status code
+
+  JsonObject sensors = doc.createNestedObject("sensors");
+  sensors["ina226"]             = checkINA226str();
+  sensors["as5600"]              = checkAS5600str();
+  sensors["i2c_fault"]           = i2cFault;
+  sensors["i2c_recovery_count"]  = i2cRecoveryCount;
+
+  JsonObject rtc = doc.createNestedObject("rtc");
+  rtc["valid"] = rtcIsValid();
+  char rtcAddrBuf[8]; snprintf(rtcAddrBuf, sizeof(rtcAddrBuf), "0x%02X", rtcAddr);
+  rtc["addr"] = String(rtcAddrBuf);
+
+  doc["eol_status"] = eolCertStatusStr();
+
+  String out; serializeJson(doc, out);
+  mqttPublish(pubStatusTopic.c_str(), out);
+  Serial.print("📤 DIAGNOSTICS: "); Serial.println(out);
+}
+
+
+
+
+// ================== ENCODER ==================
+int readAngle() {
+  if (encAddr==0x00) return -1;
+  Wire.beginTransmission(encAddr); Wire.write(0x0E); Wire.endTransmission(false);
+  Wire.requestFrom(encAddr,(uint8_t)2);
+  if (Wire.available()==2) { int h=Wire.read(),l=Wire.read(); return ((h<<8)|l)&0x0FFF; }
+  return -1;
+}
+
+void handleEncoderFault(const String &result) {
+  bool hardFault=(result=="NO_ACK"||result=="NO_ADDR"||result=="NO_MAGNET");
+  bool softFault=(result=="AGC_SAT");
+  bool healthy  =(result=="OK");
+  if (hardFault&&!encFault) {
+    encFault=true; encFaultPublished=false;
+    Serial.printf("🔴 ENC FAULT: %s\n",result.c_str());
+    if (motorState!=IDLE) stopMotor();
+    if (mqtt.connected()&&!encFaultPublished) {
+      StaticJsonDocument<160> doc;
+      doc["device_id"]=DEVICE_ID; doc["enc_event"]="ENC_FAULT";
+      doc["fault_code"]=result; doc["ts"]=getTimestamp();
+      String out; serializeJson(doc,out);
+      mqtt.publish(pubEventTopic.c_str(),out.c_str(),false,1);
+      encFaultPublished=true;
+    }
+  }
+  if (softFault&&!agcWarn) {
+    agcWarn=true;
+    Serial.println("⚠️ ENC AGC SATURATED");
+    if (mqtt.connected()) {
+      StaticJsonDocument<160> doc;
+      doc["device_id"]=DEVICE_ID; doc["enc_event"]="ENC_AGC_WARN";
+      doc["fault_code"]=result; doc["ts"]=getTimestamp();
+      String out; serializeJson(doc,out);
+      mqtt.publish(pubEventTopic.c_str(),out.c_str(),false,1);
+    }
+  }
+  if (healthy) {
+    if (encFault) {
+      encFault=false; encFaultPublished=false;
+      Serial.println("✅ ENC FAULT CLEARED");
+      if (mqtt.connected()) {
+        StaticJsonDocument<128> doc;
+        doc["device_id"]=DEVICE_ID; doc["enc_event"]="ENC_RECOVERED"; doc["ts"]=getTimestamp();
+        String out; serializeJson(doc,out); mqtt.publish(pubEventTopic.c_str(),out.c_str(),false,1);
+      }
+    }
+    if (agcWarn) { agcWarn=false; Serial.println("✅ ENC AGC CLEARED"); }
+  }
+}
+
+void handleEncoder() {
+  String encResult=checkAS5600str();
+  handleEncoderFault(encResult);
+  if (encFault) return;
+  int a=readAngle(); if (a==-1) return;
+  int diff=a-prevAngle;
+  if (diff> 3000) rotationCount--;
+  if (diff<-3000) rotationCount++;
+  prevAngle=a; angle=a;
+  totalTurns=rotationCount+(angle/4096.0);
+  if (motorState==FORWARD_RUN&&totalTurns>=MAX_TURNS){Serial.println("🛑 FWD LIMIT"); stopMotor();}
+  if (motorState==REVERSE_RUN&&totalTurns<=MIN_TURNS){Serial.println("🛑 REV LIMIT"); stopMotor();}
+}
+
+
+
+
+// ================== [BUZZ] BUZZER ==================
+void handleBuzzer() {
+  bool limitActive=(digitalRead(LIMIT_SWITCH_PIN)==LOW);
+  if (!limitActive){digitalWrite(BUZZER_PIN,HIGH);buzzerTimer=millis();return;}
+  int mode=1;
+  if      (totalTurns<=MIN_TURNS) mode=2;
+  else if (totalTurns>=MAX_TURNS) mode=3;
+  unsigned long now=millis(),elapsed=now-buzzerTimer;
+  if (mode==1) {
+    if      (elapsed<150)  digitalWrite(BUZZER_PIN,LOW);
+    else if (elapsed<600)  digitalWrite(BUZZER_PIN,HIGH);
+    else                   buzzerTimer=now;
+  } else if (mode==2) {
+    if      (elapsed<150)   digitalWrite(BUZZER_PIN,LOW);
+    else if (elapsed<300)   digitalWrite(BUZZER_PIN,HIGH);
+    else if (elapsed<450)   digitalWrite(BUZZER_PIN,LOW);
+    else if (elapsed<600)   digitalWrite(BUZZER_PIN,HIGH);
+    else if (elapsed>=1100) buzzerTimer=now;
+  } else {
+    if      (elapsed<150)   digitalWrite(BUZZER_PIN,LOW);
+    else if (elapsed<300)   digitalWrite(BUZZER_PIN,HIGH);
+    else if (elapsed<450)   digitalWrite(BUZZER_PIN,LOW);
+    else if (elapsed<600)   digitalWrite(BUZZER_PIN,HIGH);
+    else if (elapsed<750)   digitalWrite(BUZZER_PIN,LOW);
+    else if (elapsed<900)   digitalWrite(BUZZER_PIN,HIGH);
+    else if (elapsed>=1400) buzzerTimer=now;
+  }
+}
+
+
+
+
+// ================== LIMIT SWITCH ==================
+void handleLimit() {
+  bool limitNow=(digitalRead(LIMIT_SWITCH_PIN)==LOW);
+  if (!limitOverride&&limitNow&&lastLimitState==HIGH){Serial.println("🔴 LIMIT SWITCH");stopMotor();}
+  lastLimitState=limitNow;
+}
+
+
+
+
+// ================== CURRENT ==================
+void handleCurrent() {
+  float current=getCurrent();
+  bool  over=(current>CURRENT_OFF)||inaAlertFlag;
+  if (inaAlertFlag){inaAlertFlag=false;Serial.println("⚡ INA ALERT");}
+  if (motorState!=IDLE&&over&&!lastOvercurrent) {
+    Serial.println("⚠️ OVERCURRENT");
+    stopMotor(); retryCount++; ocTripTime=millis(); ocFault=true;
+    Serial.printf("🔁 ATTEMPT: %d\n",retryCount);
+    publishCurrentEvent("OC_TRIP",current);
+    if (retryCount>=3){Serial.println("🔒 CURRENT LOCKED");lockFault=true;publishCurrentEvent("LOCKED",current);}
+  }
+  lastOvercurrent=over;
+  if (ocFault&&!lockFault&&millis()-ocTripTime>RETRY_DELAY)
+    { publishCurrentEvent("OC_RETRY",current); startMotor(lastDirection); ocFault=false; }
+  static bool ocEventActive=false;
+  if (ocEventActive&&!over&&!ocFault&&!lockFault){publishCurrentEvent("OC_RESET",current);ocEventActive=false;}
+  if (ocFault&&!lockFault) ocEventActive=true;
+}
+
+
+
+
+// ================== VOLTAGE ==================
+// [BYPASS] handleVoltageSafety() now also owns the 2-minute operator-response
+// timeout for the WAIT_BYPASS state. If BYPASS_Y/BYPASS_N never arrives
+// (operator away, or MQTT/LTE unavailable entirely), the firmware forces an
+// autonomous CLOSE — independent of connectivity — and records the action
+// to NVS via emergencySaveTrigger() BEFORE commanding the motor, so the
+// event survives a reboot at any point during or after the close.
+void handleVoltageSafety() {
+  float v=getVoltage();
+  if (v<=CRITICAL_V&&vState!=LOCKED){Serial.printf("🛑 CRITICAL %.2fV\n",v);stopMotor();vState=LOCKED;publishVoltageEvent("LOCKED",v);return;}
+  if (vState==LOCKED){if(v>=RESET_V){vState=NORMAL;publishVoltageEvent("NORMAL",v);}return;}
+  if (vState==BYPASS_ACTIVE){
+    if(v<=CRITICAL_V){stopMotor();vState=LOCKED;publishVoltageEvent("LOCKED",v);return;}
+    if(v>=RESET_V){
+      vState=NORMAL; publishVoltageEvent("NORMAL",v);
+      // [SHADOW] Voltage genuinely recovered — reflect real settled state
+      StaticJsonDocument<192> fields;
+      fields["voltage_status"] = voltageStatusStr();   // "NORMAL"
+      fields["bypass_active"]  = false;
+      fields["fault"]          = faultStatusStr();     // "OK" unless another fault is active
+      fields["valve_state"]    = valveStateStr();
+      fields["last_event"]     = "VOLTAGE_RECOVERED";
+      publishShadowReported(fields.as<JsonObject>());
+    }
+    return;
+  }
+
+  // [BYPASS] No Y/N response within BYPASS_TIMEOUT_MS — fail closed
+  if (vState==WAIT_BYPASS) {
+    if (millis()-bypassWaitStart >= BYPASS_TIMEOUT_MS) {
+      Serial.println("⏱️ BYPASS TIMEOUT — no operator response, auto-closing valve");
+      publishVoltageEvent("BYPASS_TIMEOUT_AUTO_CLOSE", v);   // event topic — historical record
+      emergencySaveTrigger("BYPASS_TIMEOUT");                // [EMERGENCY] persist BEFORE acting
+
+      resumePending = false;
+      vState = BYPASS_ACTIVE;   // suppress CUT_V re-trip so the close can complete/be reflected
+
+      if (startMotor(REVERSE_RUN)) {
+        // Motor accepted the command — defer shadow publish to the real
+        // RAMP_BYPASS→RAMP_RUNNING transition in handleMotorRamp()
+        bypassTimeoutClosePending = true;
+      } else {
+        // Rejected by a guard (lock/I2C/encoder/position) — publish the
+        // TRUE current state immediately, don't leave the shadow silent
+        bypassTimeoutClosePending = false;
+        StaticJsonDocument<192> fields;
+        fields["voltage_status"] = voltageStatusStr();   // "BYPASS_ACTIVE"
+        fields["bypass_active"]  = true;
+        fields["fault"]          = faultStatusStr();     // real blocking reason
+        fields["valve_state"]    = valveStateStr();       // "IDLE" — true, motor never started
+        fields["last_event"]     = "BYPASS_TIMEOUT";
+        publishShadowReported(fields.as<JsonObject>());
+      }
+    }
+    return;
+  }
+
+  if (v<WARN_V_LOW) {
+    if (vState==NORMAL){vState=WARNING;warnPrintTimer=0;publishVoltageEvent("WARNING",v);}
+    if (millis()-warnPrintTimer>5000){warnPrintTimer=millis();Serial.printf("⚠️ VOLTAGE %.2fV\n",v);}
+  } else if (v>WARN_V_HIGH&&vState==WARNING){vState=NORMAL;publishVoltageEvent("NORMAL",v);}
+  if (v<CUT_V&&motorState!=IDLE&&vState!=WAIT_BYPASS)
+    {Serial.printf("🛑 LOW VOLTAGE CUT %.2fV\n",v);stopMotor();vState=WAIT_BYPASS;bypassWaitStart=millis();publishVoltageEvent("CUT",v);}
+}
+
+
+
+
+// ================== [DEEP] ENTER DEEP SLEEP ==================
+void enterDeepSleep() {
+  Serial.println("😴 ENTERING DEEP SLEEP");
+  clearRelays(); motorState=IDLE; rampState=RAMP_IDLE;
+  if (mqtt.connected()){mqtt.disconnect();delay(100);}
+  modemPowerOff();
+  savePosition();
+  setPositionConfidence(true);
+  armNextAlarm();
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)RTC_INT_PIN, 0);
+  Serial.println("💤 esp_deep_sleep_start()");
+  Serial.flush();
+  esp_deep_sleep_start();
+}
+
+
+
+
+// ================== JSON COMMAND HANDLER ==================
+void handleJSONCommand(String input) {
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc,input)){Serial.println("❌ JSON ERROR");return;}
+  String id=doc["device_id"]; if (id!=DEVICE_ID) return;
+  String cmd=doc["cmd"];
+  touchKeepAwake();   // [SLP] any valid command resets keep-awake window
+
+  if      (cmd=="F"){ startMotor(FORWARD_RUN); }
+  else if (cmd=="R"){ startMotor(REVERSE_RUN); }
+  else if (cmd=="S"){ stopMotor(); }
+
+  else if (vState==WAIT_BYPASS) {
+    if (cmd=="Y"){vState=BYPASS_ACTIVE;publishVoltageEvent("BYPASS",getVoltage());if(resumePending){startMotor(resumeDirection);resumePending=false;}}
+    else if (cmd=="N"){vState=WARNING;resumePending=false;}
+  }
+
+  // [CAL] Field calibration state machine — three commands
+  else if (cmd=="CALIBRATE_CLOSED") { handleCalClosed(); }
+  else if (cmd=="CALIBRATE_OPEN")   { handleCalOpen();   }
+  else if (cmd=="CALIBRATE_CANCEL") { handleCalCancel(); }
+
+  // CONFIRM_POSITION — still valid outside of calibration to accept uncertain position
+  else if (cmd=="CONFIRM_POSITION") {
+    if (calInProgress()) {
+      Serial.println("❌ CONFIRM_POSITION blocked during calibration — use CALIBRATE_CANCEL first");
+    } else {
+      setPositionConfidence(true);
+      Serial.println("✅ POSITION CONFIRMED");
+      if (mqtt.connected()) {
+        StaticJsonDocument<128> d2; d2["device_id"]=DEVICE_ID; d2["pos_event"]="POSITION_CONFIRMED";
+        d2["turns"]=totalTurns; d2["ts"]=getTimestamp();
+        String out; serializeJson(d2,out); mqttPublish(pubStatusTopic.c_str(),out);
+      }
+    }
+  }
+
+  else if (cmd=="SET_TIME") {
+    String iso=doc["iso"]|"";
+    if (iso.length()>=19) {
+      struct tm t;
+      if (parseISO(iso,t)&&rtcSetTime(t)) {
+        Serial.println("✅ RTC SET: "+iso);
+        StaticJsonDocument<128> r; r["device_id"]=DEVICE_ID; r["rtc_event"]="TIME_SET"; r["ts"]=getTimestamp();
+        String out; serializeJson(r,out); mqttPublish(pubStatusTopic.c_str(),out);
+        armNextAlarm();
+      } else Serial.println("❌ RTC write failed");
+    } else Serial.println("❌ SET_TIME: missing iso");
+  }
+
+  else if (cmd=="SCHEDULE") {
+    int slot=doc["slot"]|-1;
+    if (slot>=0&&slot<SCHED_SLOTS) {
+      String action=doc["action"]|"OPEN"; String days=doc["days"]|"0000000";
+      int hour=doc["hour"]|0; int minute=doc["minute"]|0;
+      schedSlots[slot].enabled=true; schedSlots[slot].action=(action=="CLOSE")?1:0;
+      schedSlots[slot].hour=(uint8_t)constrain(hour,0,23);
+      schedSlots[slot].minute=(uint8_t)constrain(minute,0,59);
+      if (days.length()==7){memcpy(schedSlots[slot].days,days.c_str(),7);schedSlots[slot].days[7]='\0';}
+      else                 {memcpy(schedSlots[slot].days,"0000000",7);   schedSlots[slot].days[7]='\0';}
+      saveSchedule(); armNextAlarm(); publishSchedule();
+      Serial.printf("📅 SLOT %d: %s %02d:%02d %s\n",slot,action.c_str(),hour,minute,days.c_str());
+    } else Serial.println("❌ SCHEDULE: invalid slot");
+  }
+
+  else if (cmd=="CLEAR_SCHEDULE") {
+    int slot=doc["slot"]|-1;
+    if (slot>=0&&slot<SCHED_SLOTS) {
+      schedSlots[slot].enabled=false;
+      memcpy(schedSlots[slot].days,"0000000",7); schedSlots[slot].days[7]='\0';
+      saveSchedule(); armNextAlarm(); publishSchedule();
+      Serial.printf("📅 SLOT %d CLEARED\n",slot);
+    } else Serial.println("❌ CLEAR_SCHEDULE: invalid slot");
+  }
+
+  else if (cmd=="GET_SCHEDULE")   { publishSchedule();   }
+  else if (cmd=="GET_HW_PROFILE") { publishHWProfile();  }
+  else if (cmd=="GET_STATUS")     { publishFullStatus(); }
+  else if (cmd=="GET_DIAGNOSTICS"){ publishDiagnostics(); }
+  else if (cmd=="GET_SENSORS")    { checkSensors();      }
+
+  // [APN] SET_APN
+  else if (cmd=="SET_APN") {
+    String newApn=doc["apn"]|"";
+    if (newApn.length()>0&&newApn.length()<64) {
+      saveAPN(newApn);
+      Serial.println("✅ APN SET: "+newApn);
+      StaticJsonDocument<128> d2; d2["device_id"]=DEVICE_ID; d2["apn_event"]="APN_SET";
+      d2["apn"]=newApn; d2["note"]="Takes effect on next LTE init";
+      String out; serializeJson(d2,out); mqttPublish(pubStatusTopic.c_str(),out);
+    } else Serial.println("❌ SET_APN: invalid value");
+  }
+
+  // [SLP] SET_SLEEP_TIMEOUT
+  else if (cmd=="SET_SLEEP_TIMEOUT") {
+    unsigned long v=(unsigned long)(doc["value"]|sleepTimeoutMs);
+    if (v>=MIN_SLEEP_TIMEOUT_MS&&v<=MAX_SLEEP_TIMEOUT_MS) {
+      sleepTimeoutMs=v;
+      prefs.begin("device_cfg",false); prefs.putULong("sleep_timeout",sleepTimeoutMs); prefs.end();
+      Serial.printf("😴 SLEEP TIMEOUT: %lu ms\n",sleepTimeoutMs); publishFullStatus();
+    } else Serial.printf("❌ SET_SLEEP_TIMEOUT: range %lu–%lu ms\n",MIN_SLEEP_TIMEOUT_MS,MAX_SLEEP_TIMEOUT_MS);
+  }
+
+  else if (cmd=="SET_CURRENT") {
+    float val=doc["value"]|CURRENT_OFF;
+    if (val>0.1&&val<10.0) {
+      CURRENT_OFF=val;
+      prefs.begin("device_cfg",false); prefs.putFloat("oc_thresh",CURRENT_OFF); prefs.end();
+      lockFault=false; ocFault=false; retryCount=0;
+      configureINAAlert(); publishCurrentEvent("THRESHOLD_SET",getCurrent());
+    } else Serial.println("❌ INVALID CURRENT VALUE");
+  }
+
+  else if (cmd=="SET_TURNS") {
+    float val=doc["value"]|MAX_TURNS;
+    if (val>=2.0&&val<=20.0) {
+      MAX_TURNS=val;
+      prefs.begin("device_cfg",false); prefs.putFloat("max_turns",MAX_TURNS); prefs.end();
+      publishFullStatus();
+    } else Serial.println("❌ INVALID TURNS (2.0–20.0)");
+  }
+
+  else if (cmd=="CHECK_UPDATE") {
+    StaticJsonDocument<128> u; u["device_id"]=DEVICE_ID; u["update_available"]=updateAvailable;
+    u["current_version"]=FW_VERSION; if(updateAvailable) u["update_version"]=pendingUpdateVer;
+    String out; serializeJson(u,out); mqttPublish(pubStatusTopic.c_str(),out);
+  }
+
+  else if (cmd=="DO_UPDATE") {
+    if (updateAvailable&&pendingUpdateURL.length()>0)
+      { Serial.println("🚀 OTA — waiting idle"); stopMotor(); fwState=FW_OTA_WAIT; }
+    else Serial.println("❌ NO UPDATE PENDING");
+  }
+}
+
+
+
+
+// ================== UPDATE TOPIC HANDLER ==================
+void handleUpdatePayload(String payload) {
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc,payload)) return;
+  String version=doc["version"]|""; String url=doc["url"]|""; String sha256=doc["sha256"]|"";
+  if (version.length()==0) return;
+  if (version!=FW_VERSION) {
+    updateAvailable=true; pendingUpdateVer=version; pendingUpdateURL=url; pendingUpdateSHA=sha256;
+    StaticJsonDocument<192> n; n["device_id"]=DEVICE_ID; n["update_available"]=true;
+    n["update_version"]=version; n["current_version"]=FW_VERSION; n["note"]="Send DO_UPDATE";
+    String out; serializeJson(n,out); mqttPublish(pubStatusTopic.c_str(),out);
+    touchKeepAwake();
+  } else { updateAvailable=false; Serial.println("✅ FW UP TO DATE"); }
+}
+
+
+
+
+// ================== [OTA] FULL OTA ==================
+void performOTA() {
+  Serial.println("🚀 OTA START");
+  esp_task_wdt_delete(NULL);   // [WDT] suspend watchdog during flash — expected long operation
+  String url=pendingUpdateURL; String host="",path="/"; int port=443;
+  if (url.startsWith("https://")) url=url.substring(8);
+  else if (url.startsWith("http://")) {url=url.substring(7);port=80;}
+  int si=url.indexOf('/');
+  if (si==-1) host=url; else {host=url.substring(0,si);path=url.substring(si);}
+  int ci=host.indexOf(':');
+  if (ci!=-1){port=host.substring(ci+1).toInt();host=host.substring(0,ci);}
+  if (!otaClient.connect(host.c_str(),port)) {
+    Serial.println("❌ OTA TCP fail");
+    if(mqtt.connected()){StaticJsonDocument<96>e;e["device_id"]=DEVICE_ID;e["ota_event"]="OTA_FAIL";e["reason"]="TCP_CONNECT";String o;serializeJson(e,o);mqttPublish(pubStatusTopic.c_str(),o);}
+    fwState=FW_ACTIVE; esp_task_wdt_add(NULL); return;
+  }
+  otaClient.print(String("GET ")+path+" HTTP/1.1\r\nHost: "+host+"\r\nConnection: close\r\n\r\n");
+  unsigned long hdrT=millis(); int contentLength=-1; bool hdrDone=false;
+  while (!hdrDone&&millis()-hdrT<10000) {
+    if (otaClient.available()) {
+      String line=otaClient.readStringUntil('\n'); line.trim();
+      if (line.startsWith("Content-Length:")||line.startsWith("content-length:"))
+        contentLength=line.substring(line.indexOf(':')+1).toInt();
+      if (line.length()==0) hdrDone=true;
+    }
+  }
+  if (contentLength<=0||!Update.begin(contentLength)) {
+    otaClient.stop();
+    if(mqtt.connected()){StaticJsonDocument<96>e;e["device_id"]=DEVICE_ID;e["ota_event"]="OTA_FAIL";e["reason"]="BAD_LENGTH";String o;serializeJson(e,o);mqttPublish(pubStatusTopic.c_str(),o);}
+    fwState=FW_ACTIVE; esp_task_wdt_add(NULL); return;
+  }
+  bool doChecksum=(pendingUpdateSHA.length()==64);
+  mbedtls_sha256_context sha256ctx;
+  if (doChecksum){mbedtls_sha256_init(&sha256ctx);mbedtls_sha256_starts(&sha256ctx,0);}
+  uint8_t buf[256]; int written=0,lastPct=-1; unsigned long dataT=millis();
+  while (written<contentLength) {
+    if (!otaClient.connected()&&!otaClient.available()){Serial.println("❌ OTA dropped");break;}
+    int rd=otaClient.readBytes(buf,min((int)sizeof(buf),contentLength-written));
+    if (rd>0) {
+      Update.write(buf,rd); if(doChecksum) mbedtls_sha256_update(&sha256ctx,buf,rd);
+      written+=rd; dataT=millis();
+      int pct=(written*100)/contentLength,bucket=pct/10;
+      if (bucket!=lastPct){lastPct=bucket;Serial.printf("📶 OTA: %d%%\n",pct);if(mqtt.connected()){StaticJsonDocument<96>p;p["device_id"]=DEVICE_ID;p["ota_event"]="OTA_PROGRESS";p["progress_pct"]=pct;String o;serializeJson(p,o);mqttPublish(pubStatusTopic.c_str(),o);}}
+    } else if (millis()-dataT>10000){Serial.println("❌ OTA timeout");break;}
+  }
+  otaClient.stop();
+  if (written!=contentLength) {
+    Update.abort(); if(doChecksum) mbedtls_sha256_free(&sha256ctx);
+    if(mqtt.connected()){StaticJsonDocument<96>e;e["device_id"]=DEVICE_ID;e["ota_event"]="OTA_FAIL";e["reason"]="INCOMPLETE";String o;serializeJson(e,o);mqttPublish(pubStatusTopic.c_str(),o);}
+    fwState=FW_ACTIVE; esp_task_wdt_add(NULL); return;
+  }
+  if (doChecksum) {
+    uint8_t digest[32]; mbedtls_sha256_finish(&sha256ctx,digest); mbedtls_sha256_free(&sha256ctx);
+    char hex[65]; for(int i=0;i<32;i++) sprintf(hex+i*2,"%02x",digest[i]); hex[64]='\0';
+    if (String(hex)!=pendingUpdateSHA) {
+      Serial.println("❌ CHECKSUM MISMATCH"); Update.abort();
+      if(mqtt.connected()){StaticJsonDocument<96>e;e["device_id"]=DEVICE_ID;e["ota_event"]="OTA_FAIL";e["reason"]="CHECKSUM";String o;serializeJson(e,o);mqttPublish(pubStatusTopic.c_str(),o);}
+      fwState=FW_ACTIVE; esp_task_wdt_add(NULL); return;
+    }
+    Serial.println("✅ CHECKSUM OK");
+  }
+  if (!Update.end()) {
+    if(mqtt.connected()){StaticJsonDocument<96>e;e["device_id"]=DEVICE_ID;e["ota_event"]="OTA_FAIL";e["reason"]="UPDATE_END";String o;serializeJson(e,o);mqttPublish(pubStatusTopic.c_str(),o);}
+    fwState=FW_ACTIVE; esp_task_wdt_add(NULL); return;
+  }
+  prefs.begin("device_cfg",false); prefs.putString("boot_check","PENDING"); prefs.end();
+  Serial.println("✅ OTA WRITTEN — rebooting");
+  if (mqtt.connected()){StaticJsonDocument<96>d;d["device_id"]=DEVICE_ID;d["ota_event"]="OTA_DONE";d["update_version"]=pendingUpdateVer;String o;serializeJson(d,o);mqttPublish(pubStatusTopic.c_str(),o);delay(500);}
+  ESP.restart();
+}
+
+
+
+
+// ================== DASHBOARD ==================
+void printDashboard() {
+  if (millis()-dashboardTimer<2000) return;
+  dashboardTimer=millis();
+  Serial.println("================================");
+  Serial.printf("V:%.2f A:%.3f Turns:%.2f/%.2f (min:%.2f)\n",
+                getVoltage(),getCurrent(),totalTurns,MAX_TURNS,MIN_TURNS);
+  Serial.print("State: ");
+  if      (motorState==IDLE)        Serial.print("IDLE");
+  else if (motorState==FORWARD_RUN) Serial.print("FWD");
+  else                              Serial.print("REV");
+  if (rampState!=RAMP_IDLE&&rampState!=RAMP_RUNNING) {
+    const char* rs[]={"IDLE","UP","BYPASS","RUN","DOWN_INIT","DOWN","DONE"};
+    Serial.printf("[%s]",rs[rampState]);
+  }
+  Serial.printf(" TLS:%s MQTT:%s RTC:%s\n",
+                tlsReady?"✅":"❌",mqtt.connected()?"✅":"❌",rtcIsValid()?"✅":"❌");
+  // Fault summary
+  bool anyFault=lockFault||(vState==LOCKED)||i2cFault||encFault||!positionConfident||calInProgress();
+  if (anyFault) {
+    Serial.printf("Fault:%s%s%s%s%s%s\n",
+                  lockFault?"OC_LOCK ":"",
+                  vState==LOCKED?"V_LOCK ":"",
+                  i2cFault?"I2C ":"",
+                  encFault?"ENC ":"",
+                  calInProgress()?"CAL_IN_PROG ":"",
+                  !positionConfident&&!calInProgress()?"POS_UNC ":"");
+  }
+  Serial.printf("HW:INA@0x%02X ENC@0x%02X RTC@0x%02X APN:%s SleepT:%lus\n",
+                inaAddr,encAddr,rtcAddr,apn.c_str(),sleepTimeoutMs/1000);
+  struct tm now;
+  if (rtcIsValid()&&rtcGetTime(now))
+    Serial.printf("Time:%04d-%02d-%02d %02d:%02d:%02d\n",
+                  now.tm_year+1900,now.tm_mon+1,now.tm_mday,
+                  now.tm_hour,now.tm_min,now.tm_sec);
+  Serial.println("================================");
+}
+
+
+
+
+// ================== LTE ==================
+void handleLTE() { while (SerialAT.available()) Serial.write(SerialAT.read()); }
+
+// [WDT] Trigger a full modem power-cycle + LTE reinit
+void triggerModemReset(const char* reason) {
+  Serial.printf("🔄 MODEM RESET: %s\n", reason);
+  if (mqtt.connected()) mqtt.disconnect();
+  mqtt.setClient(gsmClient);
+  modemPowerCycle();
+  lteState=LTE_AT; lteTimer=millis(); lteRegTries=0;
+  lteInitStartTime=millis();
+  mqttReadyTimer=0;
+  lteReady=false; tlsReady=false;
+  fwState=FW_LTE_INIT;
+}
+
+void handleLTEInit() {
+  // [WDT] Hard deadline for entire LTE init sequence
+  if (lteInitStartTime>0 && millis()-lteInitStartTime>LTE_INIT_TIMEOUT_MS) {
+    Serial.println("⏱️ LTE INIT TIMEOUT — power cycling modem");
+    triggerModemReset("LTE_INIT_TIMEOUT");
+    return;
+  }
+  unsigned long now=millis();
+  switch (lteState) {
+    case LTE_AT:
+      SerialAT.println("AT"); lteTimer=now; lteState=LTE_CPIN; break;
+    case LTE_CPIN:
+      if (now-lteTimer<LTE_STEP_MS){handleLTE();break;}
+      SerialAT.println("AT+CPIN?"); lteTimer=now; lteState=LTE_CSQ; break;
+    case LTE_CSQ:
+      if (now-lteTimer<LTE_STEP_MS){handleLTE();break;}
+      SerialAT.println("AT+CSQ"); lteTimer=now;
+      lteState=isScheduledWake?LTE_CGATT:LTE_CREG; lteRegTries=0;
+      if (isScheduledWake) Serial.println("⚡ SCHED WAKE — skip CREG");
+      break;
+    case LTE_CREG:
+      if (now-lteTimer<LTE_REG_MS){handleLTE();break;}
+      lteTimer=now; SerialAT.println("AT+CREG?");
+      { unsigned long ps=millis(); String r=""; while(millis()-ps<500){while(SerialAT.available())r+=char(SerialAT.read());}
+        Serial.println(r);
+        if (r.indexOf("0,1")!=-1||r.indexOf("0,5")!=-1){Serial.println("✅ REGISTERED");lteState=LTE_CGATT;}
+        else{lteRegTries++;if(lteRegTries>=20){Serial.println("❌ REG FAILED");lteReady=false;lteState=LTE_DONE;}} }
+      break;
+    case LTE_CGATT:
+      SerialAT.println("AT+CGATT=1"); lteTimer=now; lteState=LTE_CGDCONT; break;
+    case LTE_CGDCONT:
+      if (now-lteTimer<LTE_LONG_MS){handleLTE();break;}
+      // [APN] Use runtime apn variable instead of hardcoded string
+      SerialAT.printf("AT+CGDCONT=1,\"IP\",\"%s\"\r\n", apn.c_str());
+      lteTimer=now; lteState=LTE_CGACT; break;
+    case LTE_CGACT:
+      if (now-lteTimer<LTE_REG_MS){handleLTE();break;}
+      SerialAT.println("AT+CGACT=1,1"); lteTimer=now; lteState=LTE_CGPADDR; break;
+    case LTE_CGPADDR:
+      if (now-lteTimer<LTE_XLONG_MS){handleLTE();break;}
+      SerialAT.println("AT+CGPADDR=1"); lteTimer=now; lteState=LTE_PING; break;
+    case LTE_PING:
+      if (now-lteTimer<LTE_REG_MS){handleLTE();break;}
+      SerialAT.println("AT+CPING=\"8.8.8.8\",1,32");   // [MDM] A7670C ping command
+      lteTimer=now; lteState=LTE_DONE; break;
+    case LTE_DONE:
+      if (now-lteTimer<LTE_XLONG_MS){handleLTE();break;}
+      lteReady=true;
+      mqttReadyTimer=millis();   // [WDT] start MQTT dead-timer
+      Serial.println("✅ LTE READY"); fwState=FW_TLS_INIT; break;
+  }
+}
+
+
+
+
+// ================== MQTT ==================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg=""; for(unsigned int i=0;i<length;i++) msg+=(char)payload[i];
+  Serial.println("📩 MQTT: "+msg);
+  String t=String(topic);
+  if (t==subUpdateTopic) handleUpdatePayload(msg); else handleJSONCommand(msg);
+}
+
+void connectMQTT() {
+  if (mqtt.connected()) return;
+  if (!tlsReady){Serial.println("⚠️ TLS not ready");return;}
+  if (millis()-mqttRetryTimer<5000) return;
+
+  // [WDT] MQTT dead-timer: if LTE ready but no MQTT connection for MQTT_DEAD_MS → reset modem
+  if (mqttReadyTimer>0 && millis()-mqttReadyTimer>MQTT_DEAD_MS) {
+    Serial.println("⏱️ MQTT DEAD TIMEOUT — resetting modem");
+    triggerModemReset("MQTT_DEAD_TIMEOUT");
+    return;
+  }
+
+  mqttRetryTimer=millis();
+  Serial.println("🌐 AWS MQTT...");
+  mqtt.setServer(awsEndpoint.c_str(),awsPort);
+  mqtt.setCallback(mqttCallback);
+  mqtt.setBufferSize(512);
+  if (mqtt.connect(DEVICE_ID.c_str())) {
+    Serial.println("✅ MQTT CONNECTED");
+    mqttReadyTimer=0;   // [WDT] clear dead-timer on successful connect
+    mqtt.subscribe(subCmdTopic.c_str(),1);
+    mqtt.subscribe(subUpdateTopic.c_str(),1);
+    mqtt.subscribe(shadowAcceptedTopic.c_str(),1);
+    publishFullStatus(); publishHWProfile();
+    // [CAL] announce calibration interruption if device rebooted mid-sequence
+    if (calInProgress()) {
+      publishCalIncomplete();
+    } else if (!positionConfident) {
+      StaticJsonDocument<192> doc;
+      doc["device_id"]=DEVICE_ID; doc["pos_event"]="POSITION_UNCERTAIN";
+      doc["turns"]=totalTurns; doc["ts"]=getTimestamp();
+      doc["action"]="Send CALIBRATE_CLOSED to recalibrate or CONFIRM_POSITION to accept";
+      // [BROWNOUT] Tag the cause when known — logic/behavior unchanged,
+      // this is purely informational context for the operator/dashboard.
+      if (bootWasBrownout) doc["cause"] = "BROWNOUT";
+      String out; serializeJson(doc,out); mqttPublish(pubStatusTopic.c_str(),out);
+    }
+
+    // [BROWNOUT] One-time, per-boot, informational log — ONLY when the
+    // brownout did NOT leave position uncertain (valve was idle, last
+    // position had already been saved). This is a harmless power event:
+    // no recovery action needed, no motor block, just a maintenance-record
+    // entry. If position WAS left uncertain, the existing POSITION_UNCERTAIN
+    // path above already covers it (now tagged cause:"BROWNOUT") — no
+    // second/duplicate event is published for the same boot.
+    if (bootWasBrownout && !brownoutAnnounced) {
+      if (positionConfident) {
+        StaticJsonDocument<160> doc;
+        doc["device_id"] = DEVICE_ID;
+        doc["event"]      = "BROWNOUT_RESET";
+        doc["ts"]         = getTimestamp();
+        doc["note"]       = "Brownout reset detected; valve was idle with a known position — no action needed";
+        String out; serializeJson(doc, out); mqttPublish(pubEventTopic.c_str(), out);
+      }
+      brownoutAnnounced = true;
+    }
+
+    // [EOLCERT] Announce EOL certification gap once per boot until the unit
+    // is actually certified — same pattern as CAL_INCOMPLETE/
+    // POSITION_UNCERTAIN above, but gated on eolNotTestedAnnounced so a
+    // long-uncertified unit doesn't re-announce this on every reconnect.
+    // Status-only signal; does not block operation.
+    if (eolCertState != EOL_CERT_PASSED && !eolNotTestedAnnounced) {
+      StaticJsonDocument<224> doc;
+      doc["device_id"]  = DEVICE_ID;
+      doc["event"]       = "NOT_EOL_TESTED";
+      doc["eol_status"]  = eolCertStatusStr();
+      doc["ts"]          = getTimestamp();
+      doc["action"]      = "Unit has not completed End-of-Line certification. "
+                            "Pull EOL jumper (GPIO45) at boot to run the factory test sequence.";
+      String out; serializeJson(doc,out); mqttPublish(pubEventTopic.c_str(),out);
+
+      StaticJsonDocument<96> fields;
+      fields["eol_status"] = eolCertStatusStr();
+      publishShadowReported(fields.as<JsonObject>());
+
+      eolNotTestedAnnounced = true;
+    }
+    emergencyPublishIfPending();   // [EMERGENCY] replay any offline auto-close now that we're up
+  } else Serial.printf("❌ MQTT FAILED rc=%d\n",mqtt.state());
+}
+
+
+
+
+// ================== [EOL] FACTORY END-OF-LINE TEST MODE ==================
+//
+// Entered when GPIO45 is pulled LOW at boot. Fully independent of AWS/MQTT/
+// cellular — runs a local WiFi AP + HTTP server so a technician's laptop can
+// connect directly and view results in a browser. Reentrant: any unit can be
+// retested at any time, no permanent NVS lockout. Existing position/cal/fault
+// state is preserved and shown in the report, not wiped.
+
+WebServer eolServer(80);
+bool      eolTestRun = false;   // ensures the sequence runs exactly once per boot
+
+enum EolResult { EOL_PASS, EOL_FAIL, EOL_SKIP, EOL_INFO };
+
+struct EolItem {
+  String name;
+  EolResult result;
+  String detail;
+};
+
+#define EOL_MAX_ITEMS 10
+EolItem eolItems[EOL_MAX_ITEMS];
+int     eolItemCount = 0;
+
+void eolAddResult(const String &name, EolResult result, const String &detail) {
+  if (eolItemCount >= EOL_MAX_ITEMS) return;
+  eolItems[eolItemCount].name   = name;
+  eolItems[eolItemCount].result = result;
+  eolItems[eolItemCount].detail = detail;
+  eolItemCount++;
+  Serial.printf("🏭 EOL [%s]: %s — %s\n", name.c_str(),
+                result==EOL_PASS?"PASS":result==EOL_FAIL?"FAIL":result==EOL_SKIP?"SKIP":"INFO",
+                detail.c_str());
+}
+
+const char* eolResultStr(EolResult r) {
+  switch (r) { case EOL_PASS: return "PASS"; case EOL_FAIL: return "FAIL";
+               case EOL_SKIP: return "SKIP"; default: return "INFO"; }
+}
+
+const char* eolResultColor(EolResult r) {
+  switch (r) { case EOL_PASS: return "#1a7f37"; case EOL_FAIL: return "#cf222e";
+               case EOL_SKIP: return "#9a6700"; default: return "#0969da"; }
+}
+
+// ── Individual test routines ──────────────────────────────────────────────
+
+void eolTestI2C() {
+  bool hwOK = detectHardware();
+  char detail[96];
+  snprintf(detail, sizeof(detail), "INA226@0x%02X ENC@0x%02X RTC@0x%02X",
+           inaAddr, encAddr, rtcAddr);
+  eolAddResult("I2C_SCAN", hwOK ? EOL_PASS : EOL_FAIL, detail);
+}
+
+void eolTestRTC() {
+  if (rtcAddr == 0x00) { eolAddResult("RTC_CHECK", EOL_FAIL, "RTC not detected"); return; }
+  struct tm testTime;
+  testTime.tm_year=125; testTime.tm_mon=0; testTime.tm_mday=1;
+  testTime.tm_hour=12;  testTime.tm_min=0; testTime.tm_sec=0; testTime.tm_wday=3;
+  if (!rtcSetTime(testTime)) { eolAddResult("RTC_CHECK", EOL_FAIL, "Write failed"); return; }
+  delay(50);
+  struct tm readBack;
+  if (!rtcGetTime(readBack)) { eolAddResult("RTC_CHECK", EOL_FAIL, "Read failed"); return; }
+  bool match = (readBack.tm_year==testTime.tm_year && readBack.tm_mon==testTime.tm_mon &&
+                readBack.tm_mday==testTime.tm_mday && readBack.tm_hour==testTime.tm_hour);
+  eolAddResult("RTC_CHECK", match ? EOL_PASS : EOL_FAIL,
+               match ? "Write/read verified" : "Readback mismatch");
+}
+
+void eolTestEncoder() {
+  if (encAddr == 0x00) { eolAddResult("ENCODER_READ", EOL_FAIL, "AS5600 not detected"); return; }
+  int a = readAngle();
+  String agcResult = checkAS5600str();
+  char detail[80];
+  snprintf(detail, sizeof(detail), "angle=%d status=%s", a, agcResult.c_str());
+  eolAddResult("ENCODER_READ", (a != -1 && agcResult == "OK") ? EOL_PASS : EOL_FAIL, detail);
+}
+
+// Brief motor pulse test — no soft-ramp settle needed at EOL since there's no
+// load on the actuator yet; uses the same relay/PWM path as normal operation.
+void eolTestMotor(State dir, const char* label) {
+  if (encAddr == 0x00) { eolAddResult(label, EOL_SKIP, "No encoder — cannot verify movement"); return; }
+  float turnsBefore = totalTurns;
+  clearRelays();
+  ledcWrite(PWM_PIN, 0);
+  if (dir == FORWARD_RUN) { digitalWrite(RELAY_REV, RELAY_OFF); digitalWrite(RELAY_FWD, RELAY_ON); }
+  else                    { digitalWrite(RELAY_FWD, RELAY_OFF); digitalWrite(RELAY_REV, RELAY_ON); }
+  // Quick ramp — EOL doesn't need the full non-blocking state machine timing
+  for (int duty=0; duty<=255; duty+=15) { ledcWrite(PWM_PIN, duty); delay(20); }
+  digitalWrite(RELAY_PWR, RELAY_ON);
+  unsigned long pulseStart = millis();
+  float maxCurrent = 0;
+  while (millis() - pulseStart < 2000) {
+    handleEncoder();
+    float c = getCurrent();
+    if (c > maxCurrent) maxCurrent = c;
+    delay(20);
+  }
+  digitalWrite(RELAY_PWR, RELAY_OFF);
+  for (int duty=255; duty>=0; duty-=15) { ledcWrite(PWM_PIN, duty); delay(15); }
+  clearRelays();
+  delay(100);
+
+  float turnsDelta = fabs(totalTurns - turnsBefore);
+  bool moved   = (turnsDelta > 0.05f);
+  bool currOK  = (maxCurrent < CURRENT_OFF);
+  char detail[96];
+  snprintf(detail, sizeof(detail), "Δturns=%.3f maxI=%.2fA (limit %.2fA)",
+           turnsDelta, maxCurrent, CURRENT_OFF);
+  eolAddResult(label, (moved && currOK) ? EOL_PASS : EOL_FAIL, detail);
+
+  // Restore position bookkeeping — EOL motion is not a calibrated move,
+  // so position confidence is left as it was found (not set HIGH or LOW
+  // here; savePosition() below records wherever EOL motion left the encoder).
+  savePosition();
+}
+
+void eolTestLimitSwitch() {
+  bool limitActive = (digitalRead(LIMIT_SWITCH_PIN) == LOW);
+  eolAddResult("LIMIT_SWITCH", EOL_INFO,
+               limitActive ? "Currently TRIGGERED (LOW)" : "Currently RELEASED (HIGH)");
+}
+
+void eolTestBattery() {
+  float v = getVoltage();
+  char detail[48];
+  snprintf(detail, sizeof(detail), "%.2f V", v);
+  bool inRange = (v >= 11.0f && v <= 14.6f);
+  eolAddResult("BATTERY_V", inRange ? EOL_PASS : EOL_FAIL, detail);
+}
+
+void eolTestBuzzer() {
+  digitalWrite(BUZZER_PIN, LOW); delay(200);
+  digitalWrite(BUZZER_PIN, HIGH);
+  eolAddResult("BUZZER", EOL_INFO, "Beeped — confirm audible");
+}
+
+void eolTestModem() {
+  modemPowerOn();
+  bool alive = modemIsAlive();
+  eolAddResult("MODEM_CHECK", alive ? EOL_PASS : EOL_SKIP,
+               alive ? "AT ping OK" : "No response — SIM/antenna may not be installed yet");
+}
+
+// ── Run full sequence once ──────────────────────────────────────────────
+void eolRunTestSequence() {
+  eolItemCount = 0;
+  Serial.println("🏭 EOL TEST SEQUENCE START");
+  eolTestI2C();
+  eolTestRTC();
+  eolTestEncoder();
+  eolTestMotor(FORWARD_RUN, "MOTOR_FWD");
+  eolTestMotor(REVERSE_RUN, "MOTOR_REV");
+  eolTestLimitSwitch();
+  eolTestBattery();
+  eolTestBuzzer();
+  eolTestModem();
+  Serial.pr
+Preview truncated for large file
