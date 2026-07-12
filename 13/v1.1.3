@@ -1,0 +1,75 @@
+// ================== AWS FIRMWARE v1.1.3 ==================
+// ESP32-S3 Municipal Actuator — Session 14
+//
+// Base: aws_firmware_v1.1.2 — all prior features preserved.
+//
+// v1.1.3 CHANGES — Manual Override Limit Indication (Buzzer):
+//
+//   [BUZZER] Added one-shot buzzer indication during manual override.
+//             The buzzer activates only on the first limit-switch press;
+//             holding the switch does not retrigger the pattern. Uses the
+//             calibrated MIN_TURNS and MAX_TURNS (not fixed turn counts)
+//             with a configurable CAL_TOLERANCE to determine which
+//             physical endpoint the switch corresponds to — this makes
+//             the indication correct for any calibrated valve travel.
+//
+//             Buzzer patterns:
+//               3 beeps -> Calibrated Closed position (MIN_TURNS ± CAL_TOLERANCE)
+//               2 beeps -> Calibrated Open position   (MAX_TURNS ± CAL_TOLERANCE)
+//               1 beep  -> Limit switch pressed at an unexpected position
+//
+//             If positionConfident == false at the moment the switch is
+//             first pressed, the firmware intentionally remains silent
+//             for that press — no OPEN/CLOSED indication is ever given
+//             off an untrusted position. The latch is set immediately on
+//             press (before the confidence check), so the silence
+//             decision is a snapshot taken at press-time: if confidence
+//             is restored while the switch is still held, no beep fires
+//             retroactively. The operator must release and press the
+//             limit switch again after confidence is restored to get an
+//             indication.
+//
+//             This is a purely local, manual-override-only feature —
+//             appropriate because the gearbox is disengaged during
+//             override, so there is no motor state to hook a stop event
+//             into. It does not touch encoder tracking, calibration
+//             state, NVS position storage, motor control, or AWS/MQTT
+//             traffic. Isolated entirely inside handleBuzzer().
+//
+//   [VER]   FW_VERSION bumped to aws-1.1.3
+//
+// ============================================================
+
+// ================= Buzzer Configuration =================
+constexpr float CAL_TOLERANCE = 0.15f;   // Allowed error from calibrated endpoint (turns)
+
+static bool limitBeepPlayed = false;
+
+void handleBuzzer()
+{
+    if (!limitSwitchPressed) {
+        limitBeepPlayed = false;
+        return;
+    }
+
+    if (limitBeepPlayed)
+        return;
+
+    limitBeepPlayed = true;   // Latch immediately on first press
+
+    // Position was not trusted when the limit switch was first pressed.
+    // Remain silent for this press.
+    // Operator must release and press again after position confidence
+    // has been restored.
+    if (!positionConfident)
+        return;
+
+    if (fabs(totalTurns - MIN_TURNS) <= CAL_TOLERANCE)
+        beep(3);          // Closed limit
+
+    else if (fabs(totalTurns - MAX_TURNS) <= CAL_TOLERANCE)
+        beep(2);          // Open limit
+
+    else
+        beep(1);          // Unexpected position
+}
